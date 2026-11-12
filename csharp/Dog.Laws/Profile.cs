@@ -137,12 +137,11 @@ namespace Dog.Laws
         {
             foreach (var file in options.AdditionalFiles)
             {
-                if (!file.Path.EndsWith(".dogpurity.json", StringComparison.OrdinalIgnoreCase) && !file.Path.EndsWith("dog-purity.json", StringComparison.OrdinalIgnoreCase))
-                    continue;
+                if (!file.Path.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) continue;
                 var text = file.GetText()?.ToString();
                 if (text == null) continue;
                 var parsed = Json.Parse(text);
-                if (parsed is Json.Obj obj) return FromJson(obj);
+                if (parsed is Json.Obj obj && Json.Text(obj["language"]) == "csharp" && obj["roots"] != null) return FromJson(obj);
             }
             return null;
         }

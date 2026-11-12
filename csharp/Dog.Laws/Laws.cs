@@ -45,6 +45,7 @@ namespace Dog.Laws
         {
             var byMetadata = Compilation.GetTypeByMetadataName(name);
             if (byMetadata != null) yield return byMetadata;
+            if (!name.EndsWith("Attribute") && Compilation.GetTypeByMetadataName(name + "Attribute") is INamedTypeSymbol suffixed) yield return suffixed;
             var simple = name.Split('.').Last();
             if (simple.EndsWith("Attribute")) simple = simple.Substring(0, simple.Length - "Attribute".Length);
             foreach (var type in types.Value)
@@ -64,9 +65,16 @@ namespace Dog.Laws
             {
                 var type = compilation.GetTypeByMetadataName(root.Type);
                 if (type == null) continue;
-                root.TypeSymbol = type;
                 contracts.Add(type);
-                roots.Add(root);
+                roots.Add(new Profile.RootInterface
+                {
+                    Type = root.Type,
+                    Methods = root.Methods,
+                    StateArgument = root.StateArgument,
+                    CommandArgument = root.CommandArgument,
+                    Kind = root.Kind,
+                    TypeSymbol = type,
+                });
             }
             if (roots.Count == 0 && profile.Attributes.Length == 0) return null;
             return new Laws(compilation, profile, contracts.ToImmutable(), roots.ToImmutable());

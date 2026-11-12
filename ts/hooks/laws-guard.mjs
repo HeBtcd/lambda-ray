@@ -4,6 +4,12 @@ import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const fix = (p) => p.replace(/^\/([a-zA-Z])\//, '$1:/');
+const canon = (p) => fix(p)
+  .replace(/\\/g, '/')
+  .toLowerCase()
+  .replace(/\/{2,}/g, '/')
+  .replace(/\/$/, '');
 const root = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
 
 function say(message) {
@@ -25,8 +31,10 @@ try {
 const profileName = process.env.DOG_PURITY_PROFILE ?? 'ts-fold';
 const path = payload?.tool_response?.filePath || payload?.tool_input?.file_path || '';
 const suffixes = { 'ts-fold': /\.(ts|tsx|json)$/, 'ts-pure': /\.(ts|tsx)$/ };
-const relevant = relative(root, resolve(path)).split(sep).join('/');
 if (!path || !(suffixes[profileName] ?? /\.(ts|tsx|json)$/).test(path)) process.exit(0);
+const resolved = canon(resolve(fix(path)));
+const rootCanon = canon(resolve(fix(root)));
+if (rootCanon !== '' && !resolved.startsWith(rootCanon + '/')) process.exit(0);
 
 let laws;
 try {

@@ -152,7 +152,7 @@ static List<string> CheckDirectory(string dir, string? profileArg)
         }).ToList();
 }
 
-static string ProfilesDir() => Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "profiles"));
+static string ProfilesDir() => Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "profiles"));
 
 sealed class FileText : AdditionalText
 {

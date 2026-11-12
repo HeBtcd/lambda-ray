@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dog.dev/contracts/dog.log.v1.schema.json",
+  "title": "dog.log.v1",
+  "type": "object",
+  "required": ["protocol", "game", "seed", "ticks"],
+  "additionalProperties": false,
+  "properties": {
+    "protocol": { "const": "dog.log.v1" },
+    "game": { "$ref": "#/$defs/game" },
+    "seed": { "$ref": "#/$defs/seed" },
+    "ticks": { "type": "array", "items": { "$ref": "#/$defs/batch" } },
+    "hashes": { "type": "array", "items": { "$ref": "#/$defs/hash" } },
+    "meta": { "type": "object" }
+  },
+  "$defs": {
+    "game": {
+      "type": "object",
+      "required": ["id", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "seed": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "command": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "type": "string", "minLength": 1 } }
+    },
+    "batch": { "type": "array", "items": { "$ref": "#/$defs/command" } }
+  }
+}

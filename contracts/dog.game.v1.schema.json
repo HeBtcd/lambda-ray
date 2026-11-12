@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dog.dev/contracts/dog.game.v1.schema.json",
+  "title": "dog.game.v1",
+  "$defs": {
+    "game": { "$ref": "dog.log.v1.schema.json#/$defs/game" },
+    "seed": { "$ref": "dog.log.v1.schema.json#/$defs/seed" },
+    "hash": { "$ref": "dog.log.v1.schema.json#/$defs/hash" },
+    "command": { "$ref": "dog.log.v1.schema.json#/$defs/command" },
+    "batch": { "$ref": "dog.log.v1.schema.json#/$defs/batch" },
+    "cap": { "enum": ["seek", "snapshot", "state", "assert", "cell", "cost", "frame", "reload"] },
+    "cost": {
+      "type": "object",
+      "required": ["total_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "total_ns": { "type": "integer", "minimum": 0 },
+        "parts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+      }
+    },
+    "request": {
+      "oneOf": [
+        { "type": "object", "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "hello" } } },
+        { "type": "object", "required": ["op", "seed"], "additionalProperties": false, "properties": { "op": { "const": "reset" }, "seed": { "$ref": "#/$defs/seed" } } },
+        { "type": "object", "required": ["op", "commands"], "additionalProperties": false, "properties": { "op": { "const": "step" }, "commands": { "$ref": "#/$defs/batch" } } },
+        { "type": "object", "required": ["op", "ticks"], "additionalProperties": false, "properties": { "op": { "const": "run" }, "ticks": { "type": "array", "items": { "$ref": "#/$defs/batch" } } } },
+        { "type": "object", "required": ["op", "tick"], "additionalProperties": false, "properties": { "op": { "const": "seek" }, "tick": { "type": "integer", "minimum": 0 } } },
+        { "type": "object", "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "snapshot" } } },
+        { "type": "object", "required": ["op", "snapshot"], "additionalProperties": false, "properties": { "op": { "const": "restore" }, "snapshot": {} } },
+        { "type": "object", "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "state" } } },
+        { "type": "object", "required": ["op", "ids"], "additionalProperties": false, "properties": { "op": { "const": "assert" }, "ids": { "type": "array", "items": { "type": "string" } } } },
+        {
+          "type": "object",
+          "required": ["op", "layers", "out_dir"],
+          "additionalProperties": false,
+          "properties": {
+            "op": { "const": "frame" },
+            "layers": { "type": "array", "items": { "enum": ["color", "id", "depth"] } },
+            "out_dir": { "type": "string" },
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "warm": { "type": "integer", "minimum": 0 }
+          }
+        },
+        { "type": "object", "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "reload" } } },
+        { "type": "object", "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "bye" } } }
+      ]
+    },
+    "hello": {
+      "type": "object",
+      "required": ["ok", "protocol", "game", "caps", "steps_per_second", "actions"],
+      "properties": {
+        "ok": { "const": true },
+        "protocol": { "const": "dog.game.v1" },
+        "game": { "$ref": "#/$defs/game" },
+        "caps": { "type": "array", "items": { "$ref": "#/$defs/cap" } },
+        "steps_per_second": { "type": "integer", "minimum": 1 },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/command" } },
+        "assertions": { "type": "array", "items": { "type": "string" } },
+        "goals": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "tickReply": {
+      "type": "object",
+      "required": ["ok", "tick", "hash"],
+      "properties": {
+        "ok": { "const": true },
+        "tick": { "type": "integer", "minimum": 0 },
+        "hash": { "$ref": "#/$defs/hash" },
+        "obs": {},
+        "cell": { "type": "string" },
+        "cost": { "$ref": "#/$defs/cost" }
+      }
+    },
+    "runReply": {
+      "type": "object",
+      "required": ["ok", "tick", "hashes"],
+      "properties": {
+        "ok": { "const": true },
+        "tick": { "type": "integer", "minimum": 0 },
+        "hashes": { "type": "array", "items": { "$ref": "#/$defs/hash" } },
+        "cells": { "type": "array", "items": { "type": "string" } },
+        "costs": { "type": "array", "items": { "$ref": "#/$defs/cost" } },
+        "obs": {}
+      }
+    },
+    "snapshotReply": {
+      "type": "object",
+      "required": ["ok", "tick", "hash", "snapshot"],
+      "properties": { "ok": { "const": true }, "tick": { "type": "integer" }, "hash": { "$ref": "#/$defs/hash" }, "snapshot": {} }
+    },
+    "stateReply": {
+      "type": "object",
+      "required": ["ok", "tick", "state"],
+      "properties": { "ok": { "const": true }, "tick": { "type": "integer" }, "state": {} }
+    },
+    "assertReply": {
+      "type": "object",
+      "required": ["ok", "tick", "results"],
+      "properties": {
+        "ok": { "const": true },
+        "tick": { "type": "integer" },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "pass"],
+            "properties": { "id": { "type": "string" }, "pass": { "type": "boolean" }, "message": { "type": "string" }, "expected": {}, "actual": {} }
+          }
+        }
+      }
+    },
+    "frameReply": {
+      "type": "object",
+      "required": ["ok", "tick", "manifest"],
+      "properties": { "ok": { "const": true }, "tick": { "type": "integer" }, "manifest": { "type": "string" } }
+    },
+    "reloadReply": {
+      "type": "object",
+      "required": ["ok", "tick", "hash", "version", "diverged_at"],
+      "properties": {
+        "ok": { "const": true },
+        "tick": { "type": "integer" },
+        "hash": { "$ref": "#/$defs/hash" },
+        "version": { "type": "string" },
+        "diverged_at": { "type": ["integer", "null"] }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["ok", "error"],
+      "properties": {
+        "ok": { "const": false },
+        "error": {
+          "type": "object",
+          "required": ["kind", "message"],
+          "properties": {
+            "kind": { "enum": ["crash", "unsupported", "usage", "diverged"] },
+            "message": { "type": "string" },
+            "tick": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "reply": {
+      "oneOf": [
+        { "$ref": "#/$defs/hello" },
+        { "$ref": "#/$defs/tickReply" },
+        { "$ref": "#/$defs/runReply" },
+        { "$ref": "#/$defs/snapshotReply" },
+        { "$ref": "#/$defs/stateReply" },
+        { "$ref": "#/$defs/assertReply" },
+        { "$ref": "#/$defs/frameReply" },
+        { "$ref": "#/$defs/reloadReply" },
+        { "$ref": "#/$defs/error" }
+      ]
+    }
+  }
+}

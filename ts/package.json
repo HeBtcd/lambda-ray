@@ -1,0 +1,13 @@
+{
+  "name": "dog-purity-ts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "laws": "node tools/laws.mjs ."
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}

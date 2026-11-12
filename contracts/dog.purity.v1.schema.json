@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dog.purity.v1",
+  "title": "dog purity profile",
+  "type": "object",
+  "required": ["name", "language", "diagnostics"],
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string" },
+    "language": { "enum": ["ts", "csharp", "cpp"] },
+    "diagnostics": {
+      "type": "object",
+      "description": "law name -> diagnostic id",
+      "additionalProperties": { "type": "string" }
+    },
+    "roots": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interfaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "methods"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "type": "string", "description": "metadata name of the interface/base (csharp) or marker interface (ts/cpp base)" },
+              "methods": { "type": "array", "items": { "type": "string" } },
+              "stateArgument": { "type": "integer" },
+              "commandArgument": { "type": "integer" },
+              "kind": { "enum": ["sim", "layer"] }
+            }
+          }
+        },
+        "attributes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "attribute names that mark a method/type as a purity root (csharp: attribute classes, cpp: macros)"
+        },
+        "annotations": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "annotation/decorator names marking pure functions (ts)"
+        },
+        "modules": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "module path patterns whose exports are purity roots (ts)"
+        },
+        "calls": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "function names; arguments passed to these calls are purity roots (ts: pure(...), cpp: macro)"
+        }
+      }
+    },
+    "hidden": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "clock": { "type": "array", "items": { "type": "string" } },
+        "random": { "type": "array", "items": { "type": "string" } },
+        "io": { "type": "array", "items": { "type": "string" } },
+        "global": { "type": "array", "items": { "type": "string" } },
+        "engine": { "type": "array", "items": { "type": "string" } },
+        "thread": { "type": "array", "items": { "type": "string" } },
+        "heap": { "type": "array", "items": { "type": "string" } }
+      },
+      "description": "API patterns by category. csharp: fully qualified member prefixes; ts: global identifiers and 'module:name' imports; cpp: qualified name prefixes and call names"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "values": { "type": "array", "items": { "type": "string" }, "description": "leaf value types" },
+        "containers": { "type": "array", "items": { "type": "string" }, "description": "allowed generic containers (arguments checked recursively)" },
+        "functions": { "type": "array", "items": { "type": "string" }, "description": "types that count as code, not data" },
+        "handles": { "type": "array", "items": { "type": "string" }, "description": "types that reach outside the data" },
+        "unordered": { "type": "array", "items": { "type": "string" }, "description": "containers whose order is not part of the data" },
+        "mutable": { "type": "array", "items": { "type": "string" }, "description": "mutable collections" },
+        "readonly": { "type": "array", "items": { "type": "string" }, "description": "read-only collections" },
+        "engineObjects": { "type": "array", "items": { "type": "string" }, "description": "engine object base type or name pattern" }
+      }
+    },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "appendOnlyType": { "type": "string" },
+        "mutableSequences": { "type": "array", "items": { "type": "string" } },
+        "batches": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "shell": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "marker": { "type": "string", "description": "attribute/macro/file-path that marks the shell" },
+        "baseType": { "type": "string" },
+        "exempt": { "type": "array", "items": { "type": "string" }, "description": "paths that may write back (TS shell files)" },
+        "stepCalls": { "type": "array", "items": { "type": "string" }, "description": "functions that drive the sim (only callable inside the shell)" },
+        "projectMethod": { "type": "string" }
+      }
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "readBack": { "type": "boolean", "description": "forbid reading engine state back inside project" },
+        "clock": { "type": "array", "items": { "type": "string" } },
+        "random": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

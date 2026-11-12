@@ -1,18 +1,14 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { join, relative, resolve, sep } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ts = createRequire(import.meta.url)('typescript');
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PROFILE_DIR = resolve(HERE, '../../profiles');
 
 export const KERNEL = 'src/sim/sim.ts';
 export const DEPOT = 'src/depot/schema.ts';
-const SHELLS = new Set([KERNEL]);
-const ENGINE_MODULES = new Set(['ue', 'puerts', 'react', 'react-dom']);
-const IMPURE_GLOBALS = new Set(['Date', 'performance', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval', 'requestAnimationFrame', 'queueMicrotask', 'crypto', 'process', 'globalThis', 'window', 'document', 'console', 'fetch', 'localStorage']);
-const MUTATORS = new Set(['push', 'pop', 'shift', 'unshift', 'splice', 'sort', 'reverse', 'fill', 'copyWithin', 'set', 'delete', 'add', 'clear']);
-const LOG_WRITE = /\blog\.(length\s*=[^=]|splice\(|pop\(|shift\(|unshift\(|reverse\(|sort\()|\blog\[[^\]]+\]\s*=[^=]/;
-const OPAQUE_CLASSES = new Set(['Map', 'Set', 'WeakMap', 'WeakSet', 'Date', 'Promise', 'RegExp', 'Error', 'ArrayBuffer', 'DataView']);
 
 export const LAWS = {
   'state-is-data': 'the state of a sim is plain data: numbers, strings, booleans, null, arrays and records of them',
@@ -21,6 +17,7 @@ export const LAWS = {
   'log-is-append-only': 'a log only grows; to go back, start a new log from a prefix',
   'data-enters-through-schema': 'data in a JSON file reaches the code only through load(source, schema, data)',
   'project-never-writes-back': 'what draws the state never steps the sim and never writes into the state; it sends commands',
+  'is-pure': 'a pure function reads only its arguments and returns a new value: no clock, no randomness, no IO, no hidden state, no writes to anything it did not create',
 };
 
 const FIX = {
@@ -30,11 +27,19 @@ const FIX = {
   'log-is-append-only': 'slice the prefix into a new log instead of shortening this one',
   'data-enters-through-schema': "import { load } from 'src/depot/schema' and pass the imported data through load with a schema",
   'project-never-writes-back': 'read the state useSim returns and send changes through the read() commands',
+  'is-pure': 'move the effect out of the function: read the clock, draw the random or touch IO in the caller, and pass what the function needs as arguments',
 };
 
 const posix = (path) => path.split(sep).join('/');
 
-function sourcesUnder(dir) {
+export function loadProfile(nameOrPath) {
+  const path = nameOrPath.endsWith('.json') || nameOrPath.includes('/') || nameOrPath.includes('\\')
+    ? resolve(nameOrPath)
+    : join(PROFILE_DIR, `${nameOrPath}.json`);
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+function sourcesUnder(dir, suffixes) {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -43,19 +48,42 @@ function sourcesUnder(dir) {
   }
   return entries.flatMap((entry) => {
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) return entry.name === 'node_modules' ? [] : sourcesUnder(path);
-    return /\.(ts|tsx)$/.test(entry.name) && !/\.d\.ts$/.test(entry.name) ? [path] : [];
+    if (entry.isDirectory()) return entry.name === 'node_modules' ? [] : sourcesUnder(path, suffixes);
+    return new RegExp(`\\.(${suffixes.join('|')})$`).test(entry.name) && !/\.d\.ts$/.test(entry.name) ? [path] : [];
   });
 }
 
 const isTest = (path) => /\.test\.(ts|tsx)$/.test(path);
 
-export function checkLaws({ root, files } = {}) {
+export function checkLaws({ root, files, profile } = {}) {
+  const p = profile ?? loadProfile('ts-fold');
+  const scan = p.scan ?? {};
+  const shell = p.shell ?? {};
+  const hidden = p.hidden ?? {};
+  const data = p.data ?? {};
+  const roots = p.roots ?? {};
+  const suffixes = scan.suffixes ?? ['ts', 'tsx'];
+  const scanRoots = scan.roots ?? ['src'];
+  const relevance = scan.relevance ? new RegExp(scan.relevance) : null;
+  const MUTATORS = new Set(scan.mutators ?? []);
+  const OBJECT_MUTATORS = new Set(scan.objectMutators ?? []);
+  const ENGINE_MODULES = new Set(hidden.engine ?? []);
+  const IMPURE_GLOBALS = new Set([...(hidden.clock ?? []), ...(hidden.random ?? []), ...(hidden.io ?? []), ...(hidden.global ?? []), ...(hidden.thread ?? [])]);
+  const OPAQUE = new Set(data.opaque ?? []);
+  const SHELLS = new Set(shell.exempt ?? []);
+  const STEP_CALLS = new Set(shell.stepCalls ?? []);
+  const LOG_WRITE = /\blog\.(length\s*=[^=]|splice\(|pop\(|shift\(|unshift\(|reverse\(|sort\()|\blog\[[^\]]+\]\s*=[^=]/;
+  const kernelModule = (roots.interfaces ?? []).find((i) => i.kind === 'sim')?.module ?? KERNEL;
+  const depotModule = shell.loader?.module ?? DEPOT;
+  const loaderFn = shell.loader?.function ?? 'load';
+  const useSimName = shell.useSim ?? 'useSim';
+  const foldMode = (roots.interfaces ?? []).length > 0;
+  const pureCalls = new Set(roots.calls ?? []);
+  const pureModules = new Set(roots.modules ?? []);
+
   const repoRoot = resolve(root ?? process.cwd());
-  const all = (files ?? sourcesUnder(join(repoRoot, 'src'))).filter((path) => {
-    const relevant = /\bSim\b|\bLayer\b|useSim|\.json['"]|\blog\b|stepOnce|replay/;
-    return relevant.test(readFileSync(path, 'utf8'));
-  });
+  const candidates = files ?? scanRoots.flatMap((dir) => sourcesUnder(join(repoRoot, dir), suffixes));
+  const all = candidates.filter((path) => relevance ? relevance.test(readFileSync(path, 'utf8')) : true);
   const program = ts.createProgram(all, {
     target: ts.ScriptTarget.ES2022,
     module: ts.ModuleKind.ESNext,
@@ -70,7 +98,7 @@ export function checkLaws({ root, files } = {}) {
   });
   const checker = program.getTypeChecker();
   const rel = (sourceFile) => posix(relative(repoRoot, sourceFile.fileName));
-  const ours = program.getSourceFiles().filter((file) => !file.isDeclarationFile && !file.fileName.includes('node_modules') && rel(file).startsWith('src/'));
+  const ours = program.getSourceFiles().filter((file) => !file.isDeclarationFile && !file.fileName.includes('node_modules') && scanRoots.some((dir) => rel(file).startsWith(dir)));
   const violations = [];
 
   const where = (node) => {
@@ -82,10 +110,10 @@ export function checkLaws({ root, files } = {}) {
 
   const resolved = (symbol) => (symbol && symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol);
   const declarationFile = (symbol) => symbol?.declarations?.[0]?.getSourceFile();
-  const fromKernel = (symbol, name) => {
+  const fromModule = (symbol, name, modulePath) => {
     const target = resolved(symbol);
     const file = declarationFile(target);
-    return target?.getName() === name && file && rel(file) === KERNEL;
+    return target?.getName() === name && file && rel(file) === modulePath;
   };
   const importedFrom = (symbol) => {
     const declaration = symbol?.declarations?.[0];
@@ -108,7 +136,7 @@ export function checkLaws({ root, files } = {}) {
     if (type.getCallSignatures().length > 0 || type.getConstructSignatures().length > 0) return [{ path, what: `a function (${checker.typeToString(type)})` }];
     if (checker.isArrayType(type) || checker.isTupleType(type)) return checker.getTypeArguments(type).flatMap((item, index) => dataProblems(item, `${path}[${checker.isTupleType(type) ? index : ''}]`, seen));
     const name = type.getSymbol()?.getName();
-    if (name && OPAQUE_CLASSES.has(name)) return [{ path, what: `a ${name}` }];
+    if (name && OPAQUE.has(name)) return [{ path, what: `a ${name}` }];
     if (type.getSymbol()?.flags & ts.SymbolFlags.Class) return [{ path, what: `an instance of the class ${name}` }];
     const indexed = [type.getStringIndexType(), type.getNumberIndexType()].filter(Boolean).flatMap((item) => dataProblems(item, `${path}[key]`, seen));
     const fields = type.getProperties().flatMap((property) => {
@@ -126,7 +154,7 @@ export function checkLaws({ root, files } = {}) {
     const declaration = target?.valueDeclaration ?? target?.declarations?.[0];
     if (!declaration) return null;
     const file = declaration.getSourceFile();
-    if (file.isDeclarationFile || file.fileName.includes('node_modules') || rel(file) === KERNEL) return null;
+    if (file.isDeclarationFile || file.fileName.includes('node_modules') || rel(file) === kernelModule) return null;
     if (isFunctionLike(declaration)) return declaration;
     if (ts.isVariableDeclaration(declaration) && declaration.initializer && isFunctionLike(declaration.initializer)) return declaration.initializer;
     return null;
@@ -160,14 +188,14 @@ export function checkLaws({ root, files } = {}) {
     return 'a function';
   };
 
-  function checkStep(step, label) {
+  function checkStep(step, label, law = 'step-is-pure') {
     const visited = new Set();
     const queue = [{ fn: step, via: [label] }];
     while (queue.length > 0) {
       const { fn, via } = queue.shift();
       if (visited.has(fn)) continue;
       visited.add(fn);
-      const impure = (node, message) => report('step-is-pure', node, message, via);
+      const impure = (node, message) => report(law, node, message, via);
       const visit = (node) => {
         if (ts.isPropertyAccessExpression(node) && node.expression.getText() === 'Math' && node.name.text === 'random') impure(node, 'draws Math.random');
         if (ts.isIdentifier(node) && !ts.isPropertyAccessExpression(node.parent) || (ts.isIdentifier(node) && ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node)) {
@@ -184,7 +212,7 @@ export function checkLaws({ root, files } = {}) {
         if (ts.isCallExpression(node)) {
           const callee = node.expression;
           if (ts.isPropertyAccessExpression(callee) && MUTATORS.has(callee.name.text) && !ownedBy(rootOf(callee.expression), fn)) impure(node, `calls ${callee.name.text} on ${rootOf(callee.expression).getText()}, which step did not create`);
-          if (ts.isPropertyAccessExpression(callee) && callee.expression.getText() === 'Object' && ['assign', 'defineProperty', 'setPrototypeOf'].includes(callee.name.text) && node.arguments[0] && !ownedBy(rootOf(node.arguments[0]), fn)) impure(node, `writes into ${node.arguments[0].getText()} with Object.${callee.name.text}`);
+          if (ts.isPropertyAccessExpression(callee) && callee.expression.getText() === 'Object' && OBJECT_MUTATORS.has(callee.name.text) && node.arguments[0] && !ownedBy(rootOf(node.arguments[0]), fn)) impure(node, `writes into ${node.arguments[0].getText()} with Object.${callee.name.text}`);
           const symbol = checker.getSymbolAtLocation(ts.isPropertyAccessExpression(callee) ? callee.name : callee);
           const body = bodyOf(symbol);
           if (body && !visited.has(body)) queue.push({ fn: body, via: [...via, `${nameOf(body)} (${where(body)})`] });
@@ -205,15 +233,18 @@ export function checkLaws({ root, files } = {}) {
     }
   }
 
-  function kernelTypeOf(node, name, arity) {
+  function typeOf(node, name, arity, modulePath) {
     const type = checker.getContextualType(node) ?? checker.getTypeAtLocation(node);
     const target = type?.aliasSymbol ?? type?.getSymbol();
-    if (!target || !fromKernel(target, name)) return null;
+    if (!target || !fromModule(target, name, modulePath)) return null;
     const args = type.aliasTypeArguments ?? checker.getTypeArguments(type);
     return args.length === arity ? args : null;
   }
-  const simOf = (node) => kernelTypeOf(node, 'Sim', 2);
-  const layerOf = (node) => kernelTypeOf(node, 'Layer', 3);
+  const simOf = (node) => typeOf(node, 'Sim', 2, kernelModule);
+  const layerOf = (node) => {
+    const layer = (roots.interfaces ?? []).find((i) => i.kind === 'layer');
+    return layer ? typeOf(node, layer.type, 3, layer.module ?? kernelModule) : null;
+  };
   const functionOf = (node, name) => {
     const member = node.properties.find((property) => property.name?.getText() === name);
     if (!member) return null;
@@ -222,60 +253,72 @@ export function checkLaws({ root, files } = {}) {
     return null;
   };
 
+  const pureRoots = [];
   for (const file of ours) {
     const path = rel(file);
     if (isTest(path)) continue;
     file.text.split('\n').forEach((line, index) => {
       if (LOG_WRITE.test(line)) violations.push({ law: 'log-is-append-only', at: `${path}:${index + 1}:1`, message: `shortens, reorders or overwrites a log: ${line.trim()}`, via: [], fix: FIX['log-is-append-only'] });
     });
-    if (path === KERNEL) continue;
+    if (path === kernelModule) continue;
     const simCallers = new Set();
     const visit = (node) => {
-      if (ts.isObjectLiteralExpression(node) && layerOf(node)) {
-        const [memory, input] = layerOf(node);
-        const label = `the layer at ${where(node)}`;
-        for (const problem of dataProblems(memory, checker.typeToString(memory))) report('state-is-data', node, `${problem.path} is ${problem.what}`, [label]);
-        for (const problem of dataProblems(input, checker.typeToString(input))) report('commands-are-data', node, `${problem.path} is ${problem.what}`, [label]);
-        for (const name of ['step', 'out']) {
-          const fn = functionOf(node, name);
-          if (fn) checkStep(fn, `${name} of ${label}`);
+      if (foldMode) {
+        if (ts.isObjectLiteralExpression(node) && layerOf(node)) {
+          const [memory, input] = layerOf(node);
+          const label = `the layer at ${where(node)}`;
+          for (const problem of dataProblems(memory, checker.typeToString(memory))) report('state-is-data', node, `${problem.path} is ${problem.what}`, [label]);
+          for (const problem of dataProblems(input, checker.typeToString(input))) report('commands-are-data', node, `${problem.path} is ${problem.what}`, [label]);
+          for (const name of ['step', 'out']) {
+            const fn = functionOf(node, name);
+            if (fn) checkStep(fn, `${name} of ${label}`);
+          }
         }
-      }
-      if (ts.isObjectLiteralExpression(node)) {
-        const args = simOf(node);
-        if (args) {
-          const [state, command] = args;
-          const label = `the sim at ${where(node)}`;
-          for (const problem of dataProblems(state, checker.typeToString(state))) report('state-is-data', node, `${problem.path} is ${problem.what}`, [label]);
-          for (const problem of dataProblems(command, checker.typeToString(command))) report('commands-are-data', node, `${problem.path} is ${problem.what}`, [label]);
-          const step = node.properties.find((property) => property.name?.getText() === 'step');
-          const fn = step && (ts.isMethodDeclaration(step) ? step : ts.isPropertyAssignment(step) && isFunctionLike(step.initializer) ? step.initializer : null);
-          if (fn) checkStep(fn, `step of ${label}`);
-          else if (step && ts.isPropertyAssignment(step)) {
-            const body = bodyOf(checker.getSymbolAtLocation(step.initializer));
-            if (body) checkStep(body, `step of ${label}`);
+        if (ts.isObjectLiteralExpression(node)) {
+          const args = simOf(node);
+          if (args) {
+            const [state, command] = args;
+            const label = `the sim at ${where(node)}`;
+            for (const problem of dataProblems(state, checker.typeToString(state))) report('state-is-data', node, `${problem.path} is ${problem.what}`, [label]);
+            for (const problem of dataProblems(command, checker.typeToString(command))) report('commands-are-data', node, `${problem.path} is ${problem.what}`, [label]);
+            const step = node.properties.find((property) => property.name?.getText() === 'step');
+            const fn = step && (ts.isMethodDeclaration(step) ? step : ts.isPropertyAssignment(step) && isFunctionLike(step.initializer) ? step.initializer : null);
+            if (fn) checkStep(fn, `step of ${label}`);
+            else if (step && ts.isPropertyAssignment(step)) {
+              const body = bodyOf(checker.getSymbolAtLocation(step.initializer));
+              if (body) checkStep(body, `step of ${label}`);
+            }
           }
         }
       }
-      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text.endsWith('.json') && node.importClause?.name && posix(relative(repoRoot, resolve(file.fileName, '..', node.moduleSpecifier.text))).startsWith('src/')) {
+      if (pureCalls.size > 0 && ts.isCallExpression(node) && ts.isIdentifier(node.expression) && pureCalls.has(node.expression.text)) {
+        for (const arg of node.arguments) {
+          if (isFunctionLike(arg)) pureRoots.push({ fn: arg, label: `the function passed to ${node.expression.text} at ${where(node)}` });
+          else if (ts.isIdentifier(arg)) {
+            const body = bodyOf(checker.getSymbolAtLocation(arg));
+            if (body) pureRoots.push({ fn: body, label: `${arg.text} passed to ${node.expression.text}` });
+          }
+        }
+      }
+      if (foldMode && ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text.endsWith('.json') && node.importClause?.name && posix(relative(repoRoot, resolve(file.fileName, '..', node.moduleSpecifier.text))).startsWith('src/')) {
         const data = checker.getSymbolAtLocation(node.importClause.name);
         let loaded = false;
         const find = (inner) => {
           if (ts.isCallExpression(inner)) {
             const callee = resolved(checker.getSymbolAtLocation(inner.expression));
             const calleeFile = declarationFile(callee);
-            if (callee?.getName() === 'load' && calleeFile && rel(calleeFile) === DEPOT && inner.arguments.some((arg) => ts.isIdentifier(arg) && checker.getSymbolAtLocation(arg) === data)) loaded = true;
+            if (callee?.getName() === loaderFn && calleeFile && rel(calleeFile) === depotModule && inner.arguments.some((arg) => ts.isIdentifier(arg) && checker.getSymbolAtLocation(arg) === data)) loaded = true;
           }
           ts.forEachChild(inner, find);
         };
         find(file);
-        if (!loaded) report('data-enters-through-schema', node, `${node.moduleSpecifier.text} is imported but never passed through load`);
+        if (!loaded) report('data-enters-through-schema', node, `${node.moduleSpecifier.text} is imported but never passed through ${loaderFn}`);
       }
-      if (!SHELLS.has(path) && ts.isIdentifier(node) && !ts.isImportSpecifier(node.parent)) {
+      if (foldMode && !SHELLS.has(path) && ts.isIdentifier(node) && !ts.isImportSpecifier(node.parent)) {
         const symbol = checker.getSymbolAtLocation(node);
-        if (['stepOnce', 'replay'].some((name) => fromKernel(symbol, name)) && ts.isCallExpression(node.parent) && node.parent.expression === node) report('project-never-writes-back', node, `calls ${node.text} outside the shell`);
+        if (STEP_CALLS.size > 0 && [...STEP_CALLS].some((name) => fromModule(symbol, name, kernelModule)) && ts.isCallExpression(node.parent) && node.parent.expression === node) report('project-never-writes-back', node, `calls ${node.text} outside the shell`);
       }
-      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'useSim' && ts.isVariableDeclaration(node.parent)) simCallers.add(checker.getSymbolAtLocation(node.parent.name));
+      if (foldMode && ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === useSimName && ts.isVariableDeclaration(node.parent)) simCallers.add(checker.getSymbolAtLocation(node.parent.name));
       ts.forEachChild(node, visit);
     };
     visit(file);
@@ -291,6 +334,7 @@ export function checkLaws({ root, files } = {}) {
       writes(file);
     }
   }
+  for (const { fn, label } of pureRoots) checkStep(fn, label, 'is-pure');
 
   const seen = new Set();
   return violations.filter((violation) => {
@@ -306,10 +350,17 @@ export function formatted(violations) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
-  const root = process.argv[2] ?? process.cwd();
-  const violations = checkLaws({ root });
+  const args = process.argv.slice(2);
+  let profileName = 'ts-fold';
+  const paths = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--profile' && i + 1 < args.length) { profileName = args[++i]; }
+    else paths.push(args[i]);
+  }
+  const root = paths[0] ?? process.cwd();
+  const violations = checkLaws({ root, profile: loadProfile(profileName) });
   if (violations.length === 0) {
-    console.log('laws: every sim keeps append, fold and project');
+    console.log(`laws (${profileName}): clean`);
   } else {
     console.log(formatted(violations));
     console.log(`\n${violations.length} violation(s)`);

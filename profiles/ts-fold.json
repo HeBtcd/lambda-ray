@@ -1,0 +1,44 @@
+{
+  "name": "ts-fold",
+  "language": "ts",
+  "diagnostics": {
+    "state-is-data": "state-is-data",
+    "commands-are-data": "commands-are-data",
+    "step-is-pure": "step-is-pure",
+    "log-is-append-only": "log-is-append-only",
+    "data-enters-through-schema": "data-enters-through-schema",
+    "project-never-writes-back": "project-never-writes-back"
+  },
+  "roots": {
+    "interfaces": [
+      { "type": "Sim", "methods": ["step"], "stateArgument": 0, "commandArgument": 1, "kind": "sim", "module": "src/sim/sim.ts" },
+      { "type": "Layer", "methods": ["step", "out"], "stateArgument": 0, "commandArgument": 1, "kind": "layer", "module": "src/sim/sim.ts" }
+    ]
+  },
+  "hidden": {
+    "clock": ["Date", "performance"],
+    "random": ["Math.random", "crypto"],
+    "io": ["fetch", "localStorage", "process"],
+    "global": ["globalThis", "window", "document", "console"],
+    "engine": ["ue", "puerts", "react", "react-dom"],
+    "thread": ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame", "queueMicrotask"]
+  },
+  "data": {
+    "opaque": ["Map", "Set", "WeakMap", "WeakSet", "Date", "Promise", "RegExp", "Error", "ArrayBuffer", "DataView"]
+  },
+  "log": {
+    "appendOnlyType": "Log"
+  },
+  "shell": {
+    "exempt": ["src/sim/sim.ts"],
+    "stepCalls": ["stepOnce", "replay"],
+    "useSim": "useSim",
+    "loader": { "module": "src/depot/schema.ts", "function": "load" }
+  },
+  "scan": {
+    "roots": ["src/"],
+    "relevance": "\\bSim\\b|\\bLayer\\b|useSim|\\.json['\"]|\\blog\\b|stepOnce|replay",
+    "mutators": ["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set", "delete", "add", "clear"],
+    "objectMutators": ["assign", "defineProperty", "setPrototypeOf"]
+  }
+}

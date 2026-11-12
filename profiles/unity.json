@@ -1,0 +1,84 @@
+{
+  "name": "unity",
+  "language": "csharp",
+  "diagnostics": {
+    "state-is-data": "DOG001",
+    "commands-are-data": "DOG002",
+    "step-is-pure": "DOG003",
+    "log-is-append-only": "DOG004",
+    "project-never-writes-back": "DOG005",
+    "project-is-a-function-of-state": "DOG006"
+  },
+  "roots": {
+    "interfaces": [
+      { "type": "Dog.Sim.ISim`2", "methods": ["Step"], "stateArgument": 0, "commandArgument": 1, "kind": "sim" },
+      { "type": "Dog.Sim.ILayer`3", "methods": ["Step", "Out"], "stateArgument": 0, "commandArgument": 1, "kind": "layer" }
+    ]
+  },
+  "hidden": {
+    "clock": [
+      "UnityEngine.Time.",
+      "System.DateTime.Now", "System.DateTime.UtcNow", "System.DateTime.Today",
+      "System.DateTimeOffset.Now", "System.DateTimeOffset.UtcNow",
+      "System.Diagnostics.Stopwatch.", "System.Environment.Tick"
+    ],
+    "random": [
+      "UnityEngine.Random.", "System.Guid.NewGuid", "System.Random."
+    ],
+    "io": [
+      "System.IO.", "System.Console.", "System.Environment", "System.Diagnostics.Process"
+    ],
+    "global": [],
+    "engine": ["UnityEngine.", "UnityEditor."],
+    "thread": ["System.Net.", "System.Threading.", "System.Threading.Tasks."]
+  },
+  "data": {
+    "engineObjects": ["UnityEngine.Object"],
+    "unordered": [
+      "System.Collections.Generic.Dictionary<TKey, TValue>", "System.Collections.Generic.HashSet<T>",
+      "System.Collections.Generic.IDictionary<TKey, TValue>", "System.Collections.Generic.IReadOnlyDictionary<TKey, TValue>",
+      "System.Collections.Generic.ISet<T>", "System.Collections.Generic.IReadOnlySet<T>",
+      "System.Collections.Concurrent.ConcurrentDictionary<TKey, TValue>", "System.Collections.Concurrent.ConcurrentBag<T>",
+      "System.Collections.Immutable.ImmutableDictionary<TKey, TValue>", "System.Collections.Immutable.ImmutableHashSet<T>",
+      "System.Collections.Immutable.IImmutableDictionary<TKey, TValue>", "System.Collections.Immutable.IImmutableSet<T>",
+      "System.Collections.Hashtable"
+    ],
+    "mutable": [
+      "System.Collections.Generic.List<T>", "System.Collections.Generic.Queue<T>", "System.Collections.Generic.Stack<T>",
+      "System.Collections.Generic.LinkedList<T>", "System.Collections.Generic.SortedList<TKey, TValue>",
+      "System.Collections.Generic.SortedDictionary<TKey, TValue>", "System.Collections.Generic.SortedSet<T>",
+      "System.Collections.Generic.IList<T>", "System.Collections.Generic.ICollection<T>",
+      "System.Collections.ObjectModel.Collection<T>", "System.Collections.ObjectModel.ObservableCollection<T>",
+      "System.Collections.ArrayList", "System.Collections.IList", "System.Text.StringBuilder"
+    ],
+    "readonly": [
+      "System.Collections.Generic.IReadOnlyList<T>", "System.Collections.Generic.IReadOnlyCollection<T>",
+      "System.Collections.Generic.IEnumerable<T>", "System.Collections.Generic.KeyValuePair<TKey, TValue>",
+      "System.Collections.Immutable.ImmutableArray<T>", "System.Collections.Immutable.ImmutableList<T>",
+      "System.Collections.Immutable.IImmutableList<T>", "System.Collections.Immutable.ImmutableQueue<T>",
+      "System.Collections.Immutable.ImmutableStack<T>", "System.Collections.Immutable.ImmutableSortedSet<T>",
+      "System.Collections.Immutable.ImmutableSortedDictionary<TKey, TValue>", "System.Nullable<T>",
+      "System.Collections.ObjectModel.ReadOnlyCollection<T>", "Dog.Sim.Log<T>"
+    ]
+  },
+  "log": {
+    "appendOnlyType": "Dog.Sim.Log`1",
+    "mutableSequences": [
+      "System.Collections.Generic.List<T>", "System.Collections.Generic.Queue<T>", "System.Collections.Generic.Stack<T>",
+      "System.Collections.Generic.LinkedList<T>", "System.Collections.Generic.IList<T>", "System.Collections.Generic.ICollection<T>",
+      "System.Collections.ObjectModel.Collection<T>", "System.Collections.ObjectModel.ObservableCollection<T>"
+    ],
+    "batches": [
+      "System.Collections.Generic.IReadOnlyList<T>", "System.Collections.Generic.IReadOnlyCollection<T>", "System.Collections.Generic.IEnumerable<T>",
+      "System.Collections.Generic.List<T>", "System.Collections.Generic.IList<T>", "System.Collections.Generic.ICollection<T>",
+      "System.Collections.Immutable.ImmutableArray<T>", "System.Collections.Immutable.ImmutableList<T>", "System.Collections.Immutable.IImmutableList<T>"
+    ]
+  },
+  "shell": {
+    "marker": "Dog.Sim.SimShellAttribute",
+    "baseType": "Dog.Sim.SimShell`2",
+    "stepCalls": ["Step"],
+    "projectMethod": "Project"
+  },
+  "projection": { "readBack": true }
+}

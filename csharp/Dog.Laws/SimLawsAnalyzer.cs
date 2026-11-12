@@ -26,9 +26,11 @@ namespace Dog.Laws
             context.EnableConcurrentExecution();
             context.RegisterCompilationStartAction(start =>
             {
-                var laws = Laws.For(start.Compilation);
+                var profile = Profile.FromAdditionalFiles(start.Options) ?? Profile.Unity;
+                var laws = Laws.For(start.Compilation, profile);
                 if (laws == null) return;
                 start.RegisterSymbolAction(laws.CheckType, SymbolKind.NamedType);
+                start.RegisterSymbolAction(laws.CheckMethod, SymbolKind.Method);
                 start.RegisterOperationAction(laws.CheckWriteBack,
                     OperationKind.Invocation, OperationKind.SimpleAssignment, OperationKind.CompoundAssignment,
                     OperationKind.CoalesceAssignment, OperationKind.Increment, OperationKind.Decrement,

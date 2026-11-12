@@ -118,7 +118,7 @@ namespace Dog.Laws
                     break;
                 case IObjectCreationOperation creation when creation.Type != null:
                     var made = creation.Type.ToDisplayString();
-                    if (made == "System.Random") Say(creation, "creates System.Random", via, RandomFix);
+                    if (CreatesHidden("random", made)) Say(creation, $"creates {made}", via, RandomFix);
                     else if (laws.IsEngineObject(creation.Type)) Say(creation, $"creates the engine object {made}", via, EngineFix);
                     else if (World(creation.Type)) Say(creation, $"creates {made}", via, WorldFix);
                     if (creation.Constructor != null) Follow(creation.Constructor, via);
@@ -156,13 +156,11 @@ namespace Dog.Laws
             if (type == null) return;
             var space = type.ContainingNamespace?.ToDisplayString() ?? "";
             var name = $"{type.ToDisplayString()}.{member.Name}";
-            if (space == "UnityEngine" && type.Name == "Time"
-                || (type.SpecialType == SpecialType.System_DateTime || name.StartsWith("System.DateTimeOffset.")) && (member.Name == "Now" || member.Name == "UtcNow" || member.Name == "Today")
-                || name.StartsWith("System.Diagnostics.Stopwatch.") || name.StartsWith("System.Environment.Tick"))
+            if (Hidden("clock", name, space, type))
             {
                 Say(at, $"{verb} {name}", via, ClockFix);
             }
-            else if (space == "UnityEngine" && type.Name == "Random" || name == "System.Guid.NewGuid" || name.StartsWith("System.Random."))
+            else if (Hidden("random", name, space, type))
             {
                 Say(at, $"{verb} {name}", via, RandomFix);
             }
@@ -176,15 +174,50 @@ namespace Dog.Laws
             }
         }
 
-        private static bool IsEngine(string space) =>
-            space == "UnityEngine" || space.StartsWith("UnityEngine.") || space == "UnityEditor" || space.StartsWith("UnityEditor.");
+        private bool CreatesHidden(string category, string typeName)
+        {
+            foreach (var pattern in laws.Profile.HiddenOf(category))
+            {
+                if (typeName.StartsWith(pattern.TrimEnd('.'), StringComparison.Ordinal)) return true;
+            }
+            return false;
+        }
 
-        private static bool World(ITypeSymbol type)
+        private bool Hidden(string category, string memberName, string space, ITypeSymbol type)
+        {
+            foreach (var pattern in laws.Profile.HiddenOf(category))
+            {
+                if (memberName.StartsWith(pattern, StringComparison.Ordinal)) return true;
+                if (space == pattern.TrimEnd('.') || (space + ".").StartsWith(pattern, StringComparison.Ordinal) && pattern.EndsWith("."))
+                    return true;
+            }
+            return false;
+        }
+
+        private bool IsEngine(string space)
+        {
+            foreach (var pattern in laws.Profile.HiddenOf("engine"))
+            {
+                var trimmed = pattern.TrimEnd('.');
+                if (space == trimmed || space.StartsWith(trimmed + ".")) return true;
+            }
+            return false;
+        }
+
+        private bool World(ITypeSymbol type)
         {
             var space = type.ContainingNamespace?.ToDisplayString() ?? "";
             var name = type.ToDisplayString();
-            return space == "System.IO" || space.StartsWith("System.Net") || space == "System.Threading" || space == "System.Threading.Tasks"
-                || name == "System.Console" || name == "System.Environment" || name == "System.Diagnostics.Process";
+            foreach (var pattern in laws.Profile.HiddenOf("io").Concat(laws.Profile.HiddenOf("thread")))
+            {
+                var trimmed = pattern.TrimEnd('.');
+                if (pattern.EndsWith("."))
+                {
+                    if (space == trimmed || space.StartsWith(trimmed + ".") || name.StartsWith(pattern, StringComparison.Ordinal)) return true;
+                }
+                else if (name == trimmed || space == trimmed) return true;
+            }
+            return false;
         }
 
         private void Follow(IMethodSymbol method, string via)

@@ -1,0 +1,24 @@
+{
+  "name": "ts-pure",
+  "language": "ts",
+  "diagnostics": {
+    "step-is-pure": "step-is-pure"
+  },
+  "roots": {
+    "calls": ["pure"],
+    "modules": []
+  },
+  "hidden": {
+    "clock": ["Date", "performance"],
+    "random": ["Math.random", "crypto"],
+    "io": ["fetch", "localStorage", "process"],
+    "global": ["globalThis", "window", "document", "console"],
+    "engine": [],
+    "thread": ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame", "queueMicrotask"]
+  },
+  "scan": {
+    "roots": ["src/", "lib/", "test/", "tests/"],
+    "mutators": ["push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin", "set", "delete", "add", "clear"],
+    "objectMutators": ["assign", "defineProperty", "setPrototypeOf"]
+  }
+}

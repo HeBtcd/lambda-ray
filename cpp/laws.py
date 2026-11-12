@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 import time
@@ -7,6 +8,7 @@ from pathlib import Path
 import tree_sitter_cpp
 from tree_sitter import Language, Parser
 
+PROFILES = Path(__file__).resolve().parent.parent / "profiles"
 KERNEL = "DogSim.h"
 
 LAWS = {
@@ -16,118 +18,71 @@ LAWS = {
     "log-is-append-only": "Keep the command log in a TDogLog<FCommand>, grow it only with Append and replay it with DogSeek.",
     "project-never-writes-back": "Step the sim and assign its state only inside a class marked DOG_SIM_SHELL; everything else reads the state and sends commands.",
     "project-is-a-function-of-state": "Make the shell's Project compute the screen only from its state argument, const members and the engine objects it writes to: put time, randomness and counters into the state (advanced by Step) or a TDogLayer the shell folds, never into shell fields, statics or engine clocks.",
+    "is-pure": "A pure function computes only from its arguments: no clock, no randomness, no IO, no hidden state, no writes to anything it did not create.",
 }
 
-SUFFIXES = {".h", ".hh", ".hpp", ".inl", ".cpp", ".cc", ".cxx"}
+FIX = {
+    "state-is-data": LAWS["state-is-data"],
+    "commands-are-data": LAWS["commands-are-data"],
+    "step-is-pure": LAWS["step-is-pure"],
+    "log-is-append-only": LAWS["log-is-append-only"],
+    "project-never-writes-back": LAWS["project-never-writes-back"],
+    "project-is-a-function-of-state": LAWS["project-is-a-function-of-state"],
+    "is-pure": "move the effect out: read the clock, the random draw or the world in the caller and pass what the function needs as arguments",
+}
 
-MACRO_CALLS = re.compile(rb"\b(?:USTRUCT|UCLASS|UENUM|UINTERFACE|UPROPERTY|UFUNCTION|UMETA|UPARAM|UDELEGATE|GENERATED_BODY|GENERATED_UCLASS_BODY|GENERATED_USTRUCT_BODY|GENERATED_UINTERFACE_BODY|GENERATED_IINTERFACE_BODY|UE_DEPRECATED|UE_DEPRECATED_FORGAME|UE_DEPRECATED_FORENGINE)\s*\(")
-MACRO_WORDS = re.compile(rb"\b(?:[A-Z][A-Z0-9_]*_API|FORCEINLINE|FORCENOINLINE|FORCEINLINE_DEBUGGABLE|UE_NODISCARD|UE_FORCEINLINE_HINT)\b")
-SHELL = re.compile(rb"\bDOG_SIM_SHELL\b")
-TEMPLATE_ARGS = re.compile(r"<[^<>]*>")
-
-VALUES = {
-    "bool", "int", "char", "short", "long", "float", "double", "unsigned", "signed",
-    "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
-    "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "size_t",
-    "TCHAR", "ANSICHAR", "WIDECHAR", "UTF8CHAR", "UTF16CHAR", "SIZE_T", "SSIZE_T", "PTRINT", "UPTRINT",
-    "FString", "FName", "FText", "FGuid", "FDateTime", "FTimespan", "FSoftObjectPath",
-    "FVector", "FVector2D", "FVector2f", "FVector3f", "FVector3d", "FVector4", "FVector4f", "FVector4d",
-    "FIntPoint", "FIntVector", "FIntVector2", "FIntVector3", "FIntVector4", "FUintVector", "FUintVector2", "FUintVector4", "FInt64Point", "FInt64Vector",
-    "FRotator", "FRotator3f", "FRotator3d", "FQuat", "FQuat4f", "FQuat4d", "FTransform", "FTransform3f", "FTransform3d",
-    "FMatrix", "FMatrix44f", "FMatrix44d", "FPlane", "FPlane4f", "FSphere", "FRay", "FBox", "FBox2D", "FBox2f", "FBox3f", "FBox3d", "FBoxSphereBounds", "FIntRect",
-    "FLinearColor", "FColor", "FFrameNumber", "FFrameRate", "FFrameTime", "FGameplayTag", "FGameplayTagContainer",
-    "std::string", "std::wstring", "std::size_t", "std::int32_t", "std::int64_t", "std::uint8_t", "std::uint32_t", "std::uint64_t",
-}
-CONTAINERS = {
-    "TArray", "TOptional", "TStaticArray", "TPair", "TTuple", "TVariant", "TEnumAsByte", "TRange", "TInterval", "TBitArray", "TSortedMap",
-    "std::vector", "std::array", "std::optional", "std::pair", "std::tuple", "std::variant", "std::map", "std::set",
-}
-FUNCTIONS = {
-    "TFunction", "TFunctionRef", "TUniqueFunction", "TDelegate", "TMulticastDelegate", "TBaseDelegate",
-    "FSimpleDelegate", "FSimpleMulticastDelegate", "FTimerDelegate", "std::function", "std::move_only_function",
-}
-HANDLES = {
-    "TWeakObjectPtr", "TObjectPtr", "TSharedPtr", "TSharedRef", "TWeakPtr", "TUniquePtr", "TSoftObjectPtr", "TSoftClassPtr",
-    "TStrongObjectPtr", "TLazyObjectPtr", "TSubclassOf", "TScriptInterface", "TWeakInterfacePtr", "TArrayView", "TConstArrayView",
-    "FStringView", "TStringView", "FTimerHandle", "FDelegateHandle", "FWeakObjectPtr", "FSoftObjectPtr", "FObjectHandle", "TDogLog",
-    "std::shared_ptr", "std::unique_ptr", "std::weak_ptr", "std::string_view", "std::span",
-}
-UNORDERED = {"TMap", "TSet", "TMultiMap", "std::unordered_map", "std::unordered_set", "std::unordered_multimap", "std::unordered_multiset"}
-RANDOM = {"Rand", "RandInit", "RandHelper", "RandHelper64", "RandRange", "FRand", "FRandRange", "RandBool", "VRand", "VRandCone", "RandPointInBox", "RandPointInCircle", "SRand", "SRandInit"}
-CLOCKS = ("FPlatformTime::", "FDateTime::Now", "FDateTime::UtcNow", "FDateTime::Today", "FApp::GetCurrentTime", "FApp::GetDeltaTime", "FApp::GetGameTime", "FApp::GetFixedDeltaTime", "std::chrono::", "std::time", "std::clock")
-WORLD_CALLS = {"GetWorld", "GetGameInstance", "GetTimerManager", "GetWorldTimerManager", "GetWorldSettings", "GetGameState", "GetGameMode"}
-HEAP_CALLS = {"MakeShared", "MakeShareable", "MakeUnique", "NewObject", "CreateDefaultSubobject", "SpawnActor", "malloc", "calloc", "realloc", "Malloc", "Realloc"}
-MUTATORS = {
-    "Add", "AddUnique", "AddUninitialized", "AddZeroed", "AddDefaulted", "Append", "Emplace", "EmplaceAt", "Insert", "Push", "Pop",
-    "Remove", "RemoveAt", "RemoveAll", "RemoveSingle", "RemoveSwap", "RemoveAtSwap", "Reset", "Empty", "Sort", "StableSort",
-    "SetNum", "SetNumZeroed", "SetNumUninitialized", "Init", "Shrink", "Reserve", "Swap", "Set", "FindOrAdd", "Heapify", "HeapPush", "HeapPop",
-}
-ENGINE_GLOBAL = re.compile(r"^G[A-Z]\w*$")
 PROJECT = "Project"
-TIME_CALLS = {"GetTimeSeconds", "GetRealTimeSeconds", "GetUnpausedTimeSeconds", "GetAudioTimeSeconds", "GetDeltaSeconds", "GetWorldDeltaSeconds", "GetGameTimeSinceCreation", "GetTimeSince", "GetRealTimeSince", "GetAccumulatedTime", "GetGameTimeInSeconds", "GetPlatformTime"}
-TIME_FIELDS = {"TimeSeconds", "RealTimeSeconds", "UnpausedTimeSeconds", "AudioTimeSeconds", "DeltaTimeSeconds", "DeltaRealTimeSeconds", "TimeSinceCreated"}
-RANDOM_OWNERS = {"FMath", "FPlatformMath", "FGenericPlatformMath", "FWindowsPlatformMath"}
-OBJECT_POINTERS = {"TObjectPtr", "TWeakObjectPtr", "TStrongObjectPtr", "TSoftObjectPtr", "TLazyObjectPtr"}
-TARGET_CONTAINERS = {"TArray", "TStaticArray", "TInlineComponentArray"}
-ENGINE_OBJECT = re.compile(r"^[UA][A-Z]")
 
 CPP = Language(tree_sitter_cpp.language())
 
 
-@dataclass
-class Violation:
-    law: str
-    message: str
-    file: str
-    line: int
-    via: list = field(default_factory=list)
-    fix: str = ""
-
-    def __str__(self):
-        path = f" (via {' -> '.join(self.via)})" if self.via else ""
-        return f"{self.file}:{self.line}: {self.law}: {self.message}{path}. Fix: {self.fix}"
+def load_profile(name_or_path):
+    path = Path(name_or_path)
+    if not path.suffix:
+        path = PROFILES / f"{name_or_path}.json"
+    profile = json.loads(path.read_bytes())
+    return Profile(profile)
 
 
-@dataclass
-class Unit:
-    name: str
-    root: object
-    markers: list
-
-
-@dataclass
-class Member:
-    owner: str
-    name: str
-    type: object
-    kinds: list
-    mutable: bool
-    static: bool
-    node: object
-    unit: Unit
-
-
-@dataclass
-class Klass:
-    name: str
-    node: object
-    unit: Unit
-    bases: list
-    fields: list = field(default_factory=list)
-    declared: dict = field(default_factory=dict)
-    shell: bool = False
-
-
-@dataclass
-class Function:
-    name: str
-    qualname: str
-    owner: str
-    node: object
-    declarator: object
-    unit: Unit
-    static: bool
-    const: bool
+class Profile:
+    def __init__(self, raw):
+        self.raw = raw
+        self.name = raw["name"]
+        roots = raw.get("roots", {})
+        self.interfaces = roots.get("interfaces", [])
+        self.markers = roots.get("attributes", [])
+        hidden = raw.get("hidden", {})
+        self.clocks = tuple(hidden.get("clock", []))
+        self.random_names = set(hidden.get("random", []))
+        self.random_owners = set(hidden.get("randomOwners", []))
+        self.world_owners = set(hidden.get("world", []))
+        self.world_calls = set(hidden.get("worldCalls", []))
+        self.heap_calls = set(hidden.get("heap", []))
+        self.io_names = set(hidden.get("io", []))
+        self.engine_global = re.compile(hidden.get("global", r"$^"))
+        self.time_calls = set(hidden.get("timeCalls", []))
+        self.time_fields = set(hidden.get("timeFields", []))
+        data = raw.get("data", {})
+        self.values = set(data.get("values", []))
+        self.containers = set(data.get("containers", []))
+        self.functions = set(data.get("functions", []))
+        self.handles = set(data.get("handles", []))
+        self.unordered = set(data.get("unordered", []))
+        self.engine_object = re.compile(data.get("engineObjects", r"$^") if isinstance(data.get("engineObjects"), str) else (data.get("engineObjects") or [r"$^"])[0])
+        log = raw.get("log", {})
+        self.append_only = log.get("appendOnlyType", "")
+        self.mutable_sequences = set(log.get("mutableSequences", []))
+        shell = raw.get("shell", {})
+        self.shell_marker = shell.get("marker", "")
+        self.project_method = shell.get("projectMethod", PROJECT)
+        scan = raw.get("scan", {})
+        self.suffixes = set(scan.get("suffixes", [".h", ".hh", ".hpp", ".inl", ".cpp", ".cc", ".cxx"]))
+        self.macro_calls = re.compile(scan.get("macroCalls", r"$^").encode())
+        self.macro_words = re.compile(scan.get("macroWords", r"$^").encode())
+        self.mutators = set(scan.get("mutators", []))
+        self.object_pointers = set(scan.get("objectPointers", []))
+        self.target_containers = set(scan.get("targetContainers", []))
+        self.mutator_free = not self.interfaces and not self.shell_marker
 
 
 def text(node):
@@ -136,6 +91,9 @@ def text(node):
 
 def squash(value):
     return " ".join(value.split())
+
+
+TEMPLATE_ARGS = re.compile(r"<[^<>]*>")
 
 
 def bare(value):
@@ -168,20 +126,32 @@ def closing(source, start):
     return start
 
 
-def prepare(source):
+def prepare(source, profile):
     buffer = bytearray(source)
-    for match in MACRO_CALLS.finditer(source):
+    for match in profile.macro_calls.finditer(source):
         blank(buffer, match.start(), max(match.end(), closing(source, match.end() - 1)))
-    for match in MACRO_WORDS.finditer(source):
+    for match in profile.macro_words.finditer(source):
         blank(buffer, match.start(), match.end())
     markers = []
-    for match in SHELL.finditer(source):
+    pure_markers = []
+
+    def on_code_line(match):
         line = source[source.rfind(b"\n", 0, match.start()) + 1:match.start()]
-        if line.lstrip().startswith(b"#"):
-            continue
-        markers.append(match.start())
-        blank(buffer, match.start(), match.end())
-    return bytes(buffer), markers
+        return not line.lstrip().startswith(b"#")
+
+    if profile.shell_marker:
+        for match in re.compile(rb"\b" + profile.shell_marker.encode() + rb"\b").finditer(source):
+            if not on_code_line(match):
+                continue
+            markers.append(match.start())
+            blank(buffer, match.start(), match.end())
+    for marker in profile.markers:
+        for match in re.compile(rb"\b" + marker.encode() + rb"\b").finditer(source):
+            if not on_code_line(match):
+                continue
+            pure_markers.append(match.start())
+            blank(buffer, match.start(), match.end())
+    return bytes(buffer), markers, pure_markers
 
 
 def walk(node):
@@ -239,8 +209,68 @@ def type_arguments(node):
     return []
 
 
+@dataclass
+class Violation:
+    law: str
+    message: str
+    file: str
+    line: int
+    via: list = field(default_factory=list)
+    fix: str = ""
+
+    def __str__(self):
+        path = f" (via {' -> '.join(self.via)})" if self.via else ""
+        return f"{self.file}:{self.line}: {self.law}: {self.message}{path}. Fix: {self.fix}"
+
+
+@dataclass
+class Unit:
+    name: str
+    root: object
+    markers: list
+    pure_markers: list
+    source: bytes = b""
+
+
+@dataclass
+class Member:
+    owner: str
+    name: str
+    type: object
+    kinds: list
+    mutable: bool
+    static: bool
+    node: object
+    unit: Unit
+
+
+@dataclass
+class Klass:
+    name: str
+    node: object
+    unit: Unit
+    bases: list
+    fields: list = field(default_factory=list)
+    declared: dict = field(default_factory=dict)
+    shell: bool = False
+
+
+@dataclass
+class Function:
+    name: str
+    qualname: str
+    owner: str
+    node: object
+    declarator: object
+    unit: Unit
+    static: bool
+    const: bool
+    pure: bool = False
+
+
 class Checker:
-    def __init__(self, sources):
+    def __init__(self, sources, profile):
+        self.profile = profile
         self.parser = Parser(CPP)
         self.units = []
         self.classes = {}
@@ -252,8 +282,8 @@ class Checker:
         self.by_name = {}
         self.violations = {}
         for name, source in sources:
-            prepared, markers = prepare(source)
-            unit = Unit(name, self.parser.parse(prepared).root_node, markers)
+            prepared, markers, pure_markers = prepare(source, profile)
+            unit = Unit(name, self.parser.parse(prepared).root_node, markers, pure_markers, prepared)
             self.units.append(unit)
             self.collect(unit)
         for function in self.functions:
@@ -364,38 +394,66 @@ class Checker:
         qualname = f"{owner_name}::{name}" if owner_name else name
         static = has_word(node, "storage_class_specifier", "static")
         const = has_word(declarator, "type_qualifier", "const")
-        self.functions.append(Function(name, qualname, owner_name, node, declarator, unit, static, const))
+        pure = self.marked(unit, node)
+        self.functions.append(Function(name, qualname, owner_name, node, declarator, unit, static, const, pure))
+
+    def marked(self, unit, node):
+        for marker in unit.pure_markers:
+            if node.start_byte <= marker < node.end_byte:
+                return True
+            if marker < node.start_byte:
+                between = unit.source[marker:node.start_byte]
+                if b"\n" in between.strip(b" \t\r\n") or b"{" in between or b";" in between:
+                    continue
+                return True
+        return False
 
     def run(self):
+        p = self.profile
         sims = []
+        interface_names = {entry["type"] for entry in p.interfaces}
         for name, klasses in self.classes.items():
             for klass in klasses:
                 for base in klass.bases:
                     kind = short(text(base))
-                    if kind in ("TDogSim", "TDogLayer") and base.type in ("template_type", "qualified_identifier"):
-                        sims.append((klass, kind, type_arguments(base)))
+                    if kind in interface_names and base.type in ("template_type", "qualified_identifier"):
+                        entry = next(e for e in p.interfaces if e["type"] == kind)
+                        sims.append((klass, entry, type_arguments(base)))
         self.state_types = set()
         self.command_types = set()
-        for klass, kind, arguments in sims:
-            if kind == "TDogSim":
-                if len(arguments) > 0:
-                    self.check_root(arguments[0], "state-is-data", klass)
-                    self.state_types.add(short(text(arguments[0])))
-                if len(arguments) > 1:
-                    self.check_root(arguments[1], "commands-are-data", klass)
-                    self.command_types.add(short(text(arguments[1])))
-            else:
-                for argument in arguments[:2]:
-                    self.check_root(argument, "state-is-data", klass)
-                    self.state_types.add(short(text(argument)))
+        for klass, entry, arguments in sims:
+            state_arg = entry.get("stateArgument", 0)
+            command_arg = entry.get("commandArgument", 1)
+            if len(arguments) > state_arg:
+                self.check_root(arguments[state_arg], "state-is-data", klass)
+                self.state_types.add(short(text(arguments[state_arg])))
+            if entry.get("kind") == "sim" and len(arguments) > command_arg:
+                self.check_root(arguments[command_arg], "commands-are-data", klass)
+                self.command_types.add(short(text(arguments[command_arg])))
+            elif entry.get("kind") == "layer" and len(arguments) > command_arg:
+                self.check_root(arguments[command_arg], "state-is-data", klass)
+                self.state_types.add(short(text(arguments[command_arg])))
         self.reached = set()
-        for klass, kind, arguments in sims:
-            self.check_sim(klass, ("Step", "Out", "Init") if kind == "TDogLayer" else ("Step", "Init"))
+        for klass, entry, arguments in sims:
+            self.check_sim(klass, tuple(entry["methods"]))
         if sims:
             self.check_logs()
             self.check_writeback({klass.name for klass, _, _ in sims})
         self.check_projects()
+        for function in self.functions:
+            if function.pure:
+                label = function.qualname
+                self.check_pure_parameters(function, label)
+                self.visit(function, [label], frozenset(), "step-is-pure")
         return sorted(self.violations.values(), key=lambda violation: (violation.file, violation.line, violation.law, violation.message))
+
+    def check_pure_parameters(self, function, label):
+        parameters = function.declarator.child_by_field_name("parameters")
+        for parameter in parameters.named_children if parameters is not None else []:
+            name, kinds = declarator_parts(parameter.child_by_field_name("declarator"))
+            if ("reference" in kinds or "pointer" in kinds) and not has_word(parameter, "type_qualifier", "const"):
+                mark = "*" if "pointer" in kinds else ("&&" if b"&&" in parameter.text else "&")
+                self.report("step-is-pure", f"{label} takes {squash(text(parameter.child_by_field_name('type')))}{mark} {text(name)}, which it could write into", parameter, function.unit, [label])
 
     def check_root(self, argument, law, klass):
         target = argument.child_by_field_name("type") if argument.type == "type_descriptor" else argument
@@ -405,6 +463,7 @@ class Checker:
         self.check_type(target, kinds, short(text(target)) or squash(text(target)), law, argument, klass.unit, set())
 
     def check_type(self, target, kinds, path, law, node, unit, seen):
+        p = self.profile
         shown = squash(text(target))
         if "pointer" in kinds:
             self.report(law, f"{path} is a pointer ({shown}*), which reaches outside the data", node, unit)
@@ -425,13 +484,13 @@ class Checker:
                 return
         name = bare(text(target))
         last = name.split("::")[-1]
-        if name in FUNCTIONS or last in FUNCTIONS:
+        if name in p.functions or last in p.functions:
             self.report(law, f"{path} is a function ({shown}), which is code, not data", node, unit)
-        elif name in HANDLES or last in HANDLES:
+        elif name in p.handles or last in p.handles:
             self.report(law, f"{path} is the handle {last}, which points at something outside the data", node, unit)
-        elif name in UNORDERED or last in UNORDERED:
+        elif name in p.unordered or last in p.unordered:
             self.report(law, f"{path} is {last}, whose iteration order is not part of the data; use a sorted TArray of pairs", node, unit)
-        elif name in CONTAINERS or last in CONTAINERS:
+        elif name in p.containers or last in p.containers:
             for argument in type_arguments(target):
                 if argument.type == "type_descriptor":
                     inner = argument.child_by_field_name("type")
@@ -439,13 +498,13 @@ class Checker:
                         self.check_type(inner, declarator_parts(argument.child_by_field_name("declarator"))[1], path, law, node, unit, seen)
                 elif argument.type in ("identifier", "type_identifier", "qualified_identifier"):
                     self.check_type(argument, [], path, law, node, unit, seen)
-        elif name in VALUES or last in VALUES or last in self.enums:
+        elif name in p.values or last in p.values or last in self.enums:
             return
         elif last in self.aliases and last not in seen:
             alias, alias_kinds = self.aliases[last]
             if alias is not None:
                 self.check_type(alias, alias_kinds + kinds, path, law, node, unit, seen | {last})
-        elif ENGINE_OBJECT.match(last):
+        elif p.engine_object.match(last):
             self.report(law, f"{path} holds the engine object {last} by value, which lives in the engine, not in the data", node, unit)
         elif self.klass(last) is not None:
             self.check_struct(self.klass(last), path, law, seen)
@@ -498,7 +557,7 @@ class Checker:
                     if ("reference" in kinds or "pointer" in kinds) and not has_word(parameter, "type_qualifier", "const"):
                         mark = "*" if "pointer" in kinds else ("&&" if b"&&" in parameter.text else "&")
                         self.report("step-is-pure", f"{label} takes {squash(text(parameter.child_by_field_name('type')))}{mark} {text(name)}, which it could write into", parameter, function.unit, [label])
-                self.visit(function, [label], frozenset())
+                self.visit(function, [label], frozenset(), "step-is-pure")
 
     def scope(self, function):
         names = {}
@@ -593,7 +652,8 @@ class Checker:
             return self.methods(owner, text(callee.child_by_field_name("field"))) if owner else []
         return []
 
-    def visit(self, function, via, stack):
+    def visit(self, function, via, stack, law):
+        p = self.profile
         key = (function.unit.name, function.node.start_byte)
         if key in stack:
             return
@@ -607,22 +667,22 @@ class Checker:
         unit = function.unit
 
         def pure(message, node):
-            self.report("step-is-pure", f"{who} {message}", node, unit, via)
+            self.report(law, f"{who} {message}", node, unit, via)
 
         for node in walk(body):
             kind = node.type
             if kind == "qualified_identifier" and node.parent is not None and node.parent.type != "qualified_identifier":
                 name = bare(text(node))
                 parts = name.split("::")
-                if name.startswith(CLOCKS):
+                if name.startswith(p.clocks):
                     pure(f"reads the clock through {name}", node)
-                elif parts[0] == "FMath" and parts[-1] in RANDOM:
-                    pure(f"draws FMath random through {name}", node)
-                elif parts[0] in ("UGameplayStatics", "UWorld", "GEngine"):
+                elif parts[0] in p.random_owners and parts[-1] in p.random_names:
+                    pure(f"draws {parts[0]} random through {name}", node)
+                elif parts[0] in p.world_owners:
                     pure(f"reaches the world through {name}", node)
-                elif name in ("std::rand", "std::srand", "std::random_device"):
+                elif name in p.io_names:
                     pure(f"draws random through {name}", node)
-                elif parts[-1] in ("Malloc", "Realloc") and parts[0] == "FMemory":
+                elif parts[-1] in p.heap_calls and parts[0] == "FMemory":
                     pure(f"allocates on the heap through {name}", node)
             elif kind == "call_expression":
                 call_name = None
@@ -633,20 +693,20 @@ class Checker:
                     call_name = text(callee)
                 elif callee is not None and callee.type == "field_expression":
                     call_name = text(callee.child_by_field_name("field"))
-                if call_name in WORLD_CALLS:
+                if call_name in p.world_calls:
                     pure(f"reaches the world through {call_name}()", node)
                 elif call_name in ("rand", "srand"):
                     pure(f"draws random through {call_name}()", node)
                 elif call_name in ("time", "clock") and callee.type == "identifier":
                     pure(f"reads the clock through {call_name}()", node)
-                elif call_name in HEAP_CALLS and callee.type == "identifier":
+                elif call_name in p.heap_calls and callee.type == "identifier":
                     pure(f"allocates on the heap through {call_name}", node)
                 elif call_name == "FRandomStream" and callee.type == "identifier":
                     pure("makes FRandomStream; carry a seed in the state and derive values from it", node)
-                if callee is not None and callee.type == "field_expression" and call_name in MUTATORS:
+                if callee is not None and callee.type == "field_expression" and call_name in p.mutators:
                     self.check_write(callee.child_by_field_name("argument"), names, pure, node, f" through {call_name}")
                 for target in self.targets(node, function, names):
-                    self.visit(target, via + [target.qualname], stack)
+                    self.visit(target, via + [target.qualname], stack, law)
             elif kind == "compound_literal_expression" and short(text(node.child_by_field_name("type"))) == "FRandomStream":
                 pure("makes FRandomStream; carry a seed in the state and derive values from it", node)
             elif kind == "new_expression":
@@ -657,7 +717,7 @@ class Checker:
                 argument = node.child_by_field_name("argument")
                 if argument is not None and argument.type != "this":
                     pure(f"follows a pointer with -> in {squash(text(node))[:60]}", node)
-            elif kind == "identifier" and ENGINE_GLOBAL.match(text(node)) and text(node) not in names and text(node) not in self.by_name and self.klass(text(node)) is None:
+            elif kind == "identifier" and p.engine_global.match(text(node)) and text(node) not in names and text(node) not in self.by_name and self.klass(text(node)) is None:
                 pure(f"reads the engine global {text(node)}", node)
             elif kind == "declaration":
                 target = node.child_by_field_name("type")
@@ -687,13 +747,14 @@ class Checker:
         pure(f"writes into {subject}{how}, which it did not create", node)
 
     def check_logs(self):
+        p = self.profile
         for unit in self.units:
             for node in walk(unit.root):
-                if node.type != "template_type" or short(text(node)) != "TArray":
+                if node.type != "template_type" or short(text(node)) not in p.mutable_sequences:
                     continue
                 arguments = type_arguments(node)
                 inner = arguments[0].child_by_field_name("type") if arguments and arguments[0].type == "type_descriptor" else None
-                if inner is None or inner.type != "template_type" or short(text(inner)) != "TArray":
+                if inner is None or inner.type != "template_type" or short(text(inner)) not in p.mutable_sequences:
                     continue
                 element = type_arguments(inner)
                 element = element[0].child_by_field_name("type") if element and element[0].type == "type_descriptor" else None
@@ -714,7 +775,7 @@ class Checker:
         for klasses in self.classes.values():
             for klass in klasses:
                 if klass.shell:
-                    shell_fields.update(member.name for member in klass.fields if member.type is not None and (short(text(member.type)) in self.state_types or short(text(member.type)) == "TDogLog"))
+                    shell_fields.update(member.name for member in klass.fields if member.type is not None and (short(text(member.type)) in self.state_types or short(text(member.type)) == self.profile.append_only))
         for function in self.functions:
             klass = self.klass(function.owner)
             if function.owner in sims or (klass is not None and klass.shell):
@@ -737,7 +798,7 @@ class Checker:
                         parts = bare(text(callee)).split("::")
                         stepped = parts[-2] if len(parts) > 1 and parts[-1] == "Step" else None
                     if stepped in sims:
-                        self.report("project-never-writes-back", f"{function.qualname} steps the sim {stepped} outside a DOG_SIM_SHELL class", node, function.unit)
+                        self.report("project-never-writes-back", f"{function.qualname} steps the sim {stepped} outside a {self.profile.shell_marker} class", node, function.unit)
                 elif node.type in ("assignment_expression", "update_expression"):
                     target = node.child_by_field_name("left" if node.type == "assignment_expression" else "argument")
                     chain = []
@@ -751,14 +812,13 @@ class Checker:
                     if current is not None and current.type != "this" and shell_fields.intersection(chain):
                         self.report("project-never-writes-back", f"{function.qualname} writes {squash(text(target))}, which belongs to a sim shell", node, function.unit)
 
-
     def check_projects(self):
         for klasses in list(self.classes.values()):
             for klass in klasses:
                 if not klass.shell:
                     continue
-                for function in self.methods(klass.name, PROJECT):
-                    label = f"{function.owner}::{PROJECT}"
+                for function in self.methods(klass.name, self.profile.project_method):
+                    label = f"{function.owner}::{self.profile.project_method}"
                     parameters = function.declarator.child_by_field_name("parameters")
                     for parameter in parameters.named_children if parameters is not None else []:
                         name, kinds = declarator_parts(parameter.child_by_field_name("declarator"))
@@ -782,19 +842,21 @@ class Checker:
         return any(child.type == "type_qualifier" and text(child) in ("const", "constexpr", "consteval", "constinit") for child in node.children)
 
     def target(self, target, kinds):
+        p = self.profile
         if target is None:
             return False
         last = short(text(target))
         if "pointer" in kinds or "reference" in kinds:
-            return bool(ENGINE_OBJECT.match(last))
-        if last in OBJECT_POINTERS:
+            return bool(p.engine_object.match(last))
+        if last in p.object_pointers:
             return True
-        if last in TARGET_CONTAINERS:
+        if last in p.target_containers:
             arguments = [argument for argument in type_arguments(target) if argument.type == "type_descriptor"]
             return bool(arguments) and self.target(arguments[0].child_by_field_name("type"), declarator_parts(arguments[0].child_by_field_name("declarator"))[1])
         return False
 
     def visit_project(self, function, via, stack):
+        p = self.profile
         key = (function.unit.name, function.node.start_byte)
         if key in stack:
             return
@@ -822,13 +884,13 @@ class Checker:
             if kind == "qualified_identifier" and node.parent is not None and node.parent.type != "qualified_identifier":
                 name = bare(text(node))
                 parts = name.split("::")
-                if name.startswith(CLOCKS) or parts[-1] in TIME_CALLS:
+                if name.startswith(p.clocks) or parts[-1] in p.time_calls:
                     bad(f"reads the clock through {name}", node)
-                elif parts[0] in RANDOM_OWNERS and parts[-1] in RANDOM:
-                    bad(f"draws FMath random through {name}", node)
+                elif parts[0] in p.random_owners and parts[-1] in p.random_names:
+                    bad(f"draws {parts[0]} random through {name}", node)
                 elif parts[0] == "UKismetMathLibrary" and parts[-1].startswith("Random"):
                     bad(f"draws random through {name}", node)
-                elif name in ("std::rand", "std::srand", "std::random_device"):
+                elif name in p.io_names:
                     bad(f"draws random through {name}", node)
                 elif len(parts) > 1 and self.klass(parts[-2]) is not None:
                     held = next((candidate for candidate in self.klass(parts[-2]).fields if candidate.name == parts[-1]), None)
@@ -843,7 +905,7 @@ class Checker:
                     call_name = text(callee)
                 elif callee is not None and callee.type == "field_expression":
                     call_name = text(callee.child_by_field_name("field"))
-                if call_name in TIME_CALLS:
+                if call_name in p.time_calls:
                     bad(f"reads the clock through {call_name}()", node)
                 elif call_name in ("rand", "srand") and callee.type == "identifier":
                     bad(f"draws random through {call_name}()", node)
@@ -858,7 +920,7 @@ class Checker:
             elif kind == "field_expression":
                 field_name = text(node.child_by_field_name("field"))
                 argument = node.child_by_field_name("argument")
-                if field_name in TIME_FIELDS:
+                if field_name in p.time_fields:
                     bad(f"reads the clock through {squash(text(node))[:60]}", node)
                 elif argument is not None and argument.type == "this":
                     member(field_name, node)
@@ -868,7 +930,7 @@ class Checker:
                     continue
                 if name in fields:
                     member(name, node)
-                elif ENGINE_GLOBAL.match(name) and name not in self.by_name and self.klass(name) is None:
+                elif p.engine_global.match(name) and name not in self.by_name and self.klass(name) is None:
                     bad(f"reads the engine global {name}", node)
                 elif name in self.global_decls and not self.constant(self.global_decls[name]):
                     bad(f"reads the mutable global {name}", node)
@@ -880,15 +942,16 @@ class Checker:
                 if target is not None and short(text(target)) == "FRandomStream":
                     bad(f"makes FRandomStream {', '.join(declared)}; carry a seed in the state and derive values from it", node)
 
-def check_sources(sources):
-    return Checker(list(sources)).run()
+
+def check_sources(sources, profile=None):
+    return Checker(list(sources), profile or load_profile("ue")).run()
 
 
-def gather(paths, root=None):
+def gather(paths, profile, root=None):
     files = []
     for path in map(Path, paths):
         if path.is_dir():
-            files.extend(sorted(candidate for candidate in path.rglob("*") if candidate.suffix.lower() in SUFFIXES and candidate.is_file()))
+            files.extend(sorted(candidate for candidate in path.rglob("*") if candidate.suffix.lower() in profile.suffixes and candidate.is_file()))
         elif path.is_file():
             files.append(path)
     sources = []
@@ -901,17 +964,29 @@ def gather(paths, root=None):
     return sources
 
 
-def check_paths(paths, root=None):
-    return check_sources(gather(paths, root))
+def check_paths(paths, root=None, profile=None):
+    profile = profile or load_profile("ue")
+    return check_sources(gather(paths, profile, root), profile)
 
 
 def main(arguments):
-    if not arguments:
-        print("usage: python laws.py <dir or file>...", file=sys.stderr)
+    profile_name = "ue"
+    rest = []
+    index = 0
+    while index < len(arguments):
+        if arguments[index] == "--profile" and index + 1 < len(arguments):
+            profile_name = arguments[index + 1]
+            index += 2
+        else:
+            rest.append(arguments[index])
+            index += 1
+    if not rest:
+        print("usage: python laws.py [--profile <name|path>] <dir or file>...", file=sys.stderr)
         return 2
     started = time.perf_counter()
-    sources = gather(arguments)
-    violations = check_sources(sources)
+    profile = load_profile(profile_name)
+    sources = gather(rest, profile)
+    violations = check_sources(sources, profile)
     for violation in violations:
         print(violation)
     print(f"{len(violations)} violation(s) in {len(sources)} file(s), {time.perf_counter() - started:.2f}s", file=sys.stderr)

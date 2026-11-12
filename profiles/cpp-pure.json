@@ -1,0 +1,30 @@
+{
+  "name": "cpp-pure",
+  "language": "cpp",
+  "diagnostics": {
+    "step-is-pure": "step-is-pure"
+  },
+  "roots": {
+    "attributes": ["DOG_PURE"]
+  },
+  "hidden": {
+    "clock": ["FPlatformTime::", "FDateTime::Now", "FDateTime::UtcNow", "FDateTime::Today", "FApp::GetCurrentTime", "FApp::GetDeltaTime", "FApp::GetGameTime", "FApp::GetFixedDeltaTime", "std::chrono::", "std::time", "std::clock"],
+    "random": ["Rand", "RandInit", "RandHelper", "RandHelper64", "RandRange", "FRand", "FRandRange", "RandBool", "VRand", "VRandCone", "RandPointInBox", "RandPointInCircle", "SRand", "SRandInit"],
+    "randomOwners": ["FMath", "FPlatformMath", "FGenericPlatformMath", "FWindowsPlatformMath"],
+    "world": ["UGameplayStatics", "UWorld", "GEngine"],
+    "worldCalls": ["GetWorld", "GetGameInstance", "GetTimerManager", "GetWorldTimerManager", "GetWorldSettings", "GetGameState", "GetGameMode"],
+    "heap": ["MakeShared", "MakeShareable", "MakeUnique", "NewObject", "CreateDefaultSubobject", "SpawnActor", "malloc", "calloc", "realloc", "Malloc", "Realloc"],
+    "io": ["std::rand", "std::srand", "std::random_device"],
+    "global": "^G[A-Z]\\w*$",
+    "timeCalls": ["GetTimeSeconds", "GetRealTimeSeconds", "GetUnpausedTimeSeconds", "GetAudioTimeSeconds", "GetDeltaSeconds", "GetWorldDeltaSeconds", "GetGameTimeSinceCreation", "GetTimeSince", "GetRealTimeSince", "GetAccumulatedTime", "GetGameTimeInSeconds", "GetPlatformTime"],
+    "timeFields": ["TimeSeconds", "RealTimeSeconds", "UnpausedTimeSeconds", "AudioTimeSeconds", "DeltaTimeSeconds", "DeltaRealTimeSeconds", "TimeSinceCreated"]
+  },
+  "scan": {
+    "suffixes": [".h", ".hh", ".hpp", ".inl", ".cpp", ".cc", ".cxx"],
+    "macroCalls": "\\b(?:USTRUCT|UCLASS|UENUM|UINTERFACE|UPROPERTY|UFUNCTION|UMETA|UPARAM|UDELEGATE|GENERATED_BODY|GENERATED_UCLASS_BODY|GENERATED_USTRUCT_BODY|GENERATED_UINTERFACE_BODY|GENERATED_IINTERFACE_BODY|UE_DEPRECATED|UE_DEPRECATED_FORGAME|UE_DEPRECATED_FORENGINE)\\s*\\(",
+    "macroWords": "\\b(?:[A-Z][A-Z0-9_]*_API|FORCEINLINE|FORCENOINLINE|FORCEINLINE_DEBUGGABLE|UE_NODISCARD|UE_FORCEINLINE_HINT)\\b",
+    "mutators": ["Add", "AddUnique", "AddUninitialized", "AddZeroed", "AddDefaulted", "Append", "Emplace", "EmplaceAt", "Insert", "Push", "Pop", "Remove", "RemoveAt", "RemoveAll", "RemoveSingle", "RemoveSwap", "RemoveAtSwap", "Reset", "Empty", "Sort", "StableSort", "SetNum", "SetNumZeroed", "SetNumUninitialized", "Init", "Shrink", "Reserve", "Swap", "Set", "FindOrAdd", "Heapify", "HeapPush", "HeapPop"],
+    "objectPointers": ["TObjectPtr", "TWeakObjectPtr", "TStrongObjectPtr", "TSoftObjectPtr", "TLazyObjectPtr"],
+    "targetContainers": ["TArray", "TStaticArray", "TInlineComponentArray"]
+  }
+}

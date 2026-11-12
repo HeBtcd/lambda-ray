@@ -14,33 +14,62 @@ namespace Dog.Laws
         private static readonly SymbolEqualityComparer Same = SymbolEqualityComparer.Default;
 
         public readonly Compilation Compilation;
-        private readonly INamedTypeSymbol sim;
-        private readonly INamedTypeSymbol layer;
+        public readonly Profile Profile;
+        private readonly ImmutableArray<INamedTypeSymbol> contracts;
+        private readonly ImmutableArray<Profile.RootInterface> rootInterfaces;
         private readonly INamedTypeSymbol? shell;
         private readonly INamedTypeSymbol? shellBase;
-        private readonly INamedTypeSymbol? engineObject;
+        private readonly ImmutableArray<INamedTypeSymbol> engineObjects;
         private readonly Lazy<ImmutableArray<INamedTypeSymbol>> types;
         private readonly Lazy<ImmutableHashSet<ITypeSymbol>> states;
         private readonly ConcurrentDictionary<SyntaxTree, SemanticModel> models = new ConcurrentDictionary<SyntaxTree, SemanticModel>();
         private readonly ConcurrentDictionary<IMethodSymbol, ImmutableArray<IMethodSymbol>> implementations = new ConcurrentDictionary<IMethodSymbol, ImmutableArray<IMethodSymbol>>(SymbolEqualityComparer.Default);
+        private readonly Lazy<ImmutableHashSet<INamedTypeSymbol>> attributeTypes;
 
-        private Laws(Compilation compilation, INamedTypeSymbol sim, INamedTypeSymbol layer)
+        private Laws(Compilation compilation, Profile profile, ImmutableArray<INamedTypeSymbol> contracts, ImmutableArray<Profile.RootInterface> rootInterfaces)
         {
             Compilation = compilation;
-            this.sim = sim;
-            this.layer = layer;
-            shell = compilation.GetTypeByMetadataName("Dog.Sim.SimShellAttribute");
-            engineObject = compilation.GetTypeByMetadataName("UnityEngine.Object");
-            shellBase = compilation.GetTypeByMetadataName("Dog.Sim.SimShell`2");
+            Profile = profile;
+            this.contracts = contracts;
+            this.rootInterfaces = rootInterfaces;
+            shell = profile.ShellMarker == null ? null : compilation.GetTypeByMetadataName(profile.ShellMarker);
+            shellBase = profile.ShellBase == null ? null : compilation.GetTypeByMetadataName(profile.ShellBase);
+            engineObjects = profile.EngineObjects.Select(e => compilation.GetTypeByMetadataName(e)).Where(e => e != null).Cast<INamedTypeSymbol>().ToImmutableArray();
             types = new Lazy<ImmutableArray<INamedTypeSymbol>>(() => SourceTypes(compilation.Assembly.GlobalNamespace).ToImmutableArray());
-            states = new Lazy<ImmutableHashSet<ITypeSymbol>>(() => types.Value.SelectMany(Contracts).Select(c => c.TypeArguments[0]).ToImmutableHashSet<ITypeSymbol>(SymbolEqualityComparer.Default));
+            states = new Lazy<ImmutableHashSet<ITypeSymbol>>(() => types.Value.SelectMany(ContractsOf).Select(c => c.TypeArguments[rootInterfaces.First(r => Same.Equals(c.OriginalDefinition, r.TypeSymbol!)).StateArgument]).ToImmutableHashSet<ITypeSymbol>(SymbolEqualityComparer.Default));
+            attributeTypes = new Lazy<ImmutableHashSet<INamedTypeSymbol>>(() =>
+                profile.Attributes.SelectMany(FindAttribute).ToImmutableHashSet<INamedTypeSymbol>(Same));
         }
 
-        public static Laws? For(Compilation compilation)
+        private IEnumerable<INamedTypeSymbol> FindAttribute(string name)
         {
-            var sim = compilation.GetTypeByMetadataName("Dog.Sim.ISim`2");
-            var layer = compilation.GetTypeByMetadataName("Dog.Sim.ILayer`3");
-            return sim == null || layer == null ? null : new Laws(compilation, sim, layer);
+            var byMetadata = Compilation.GetTypeByMetadataName(name);
+            if (byMetadata != null) yield return byMetadata;
+            var simple = name.Split('.').Last();
+            if (simple.EndsWith("Attribute")) simple = simple.Substring(0, simple.Length - "Attribute".Length);
+            foreach (var type in types.Value)
+            {
+                if (type.Name == simple || type.Name == simple + "Attribute") yield return type;
+            }
+        }
+
+        private readonly Dictionary<INamedTypeSymbol, Profile.RootInterface> interfaceMap = new Dictionary<INamedTypeSymbol, Profile.RootInterface>(SymbolEqualityComparer.Default);
+
+        public static Laws? For(Compilation compilation, Profile profile)
+        {
+            var contracts = ImmutableArray.CreateBuilder<INamedTypeSymbol>();
+            var roots = ImmutableArray.CreateBuilder<Profile.RootInterface>();
+            var laws = new Laws(compilation, profile, ImmutableArray<INamedTypeSymbol>.Empty, ImmutableArray<Profile.RootInterface>.Empty);
+            foreach (var root in profile.Interfaces)
+            {
+                var type = compilation.GetTypeByMetadataName(root.Type);
+                if (type == null) continue;
+                root.TypeSymbol = type;
+                contracts.Add(type);
+                roots.Add(root);
+            }
+            if (roots.Count == 0 && profile.Attributes.Length == 0) return null;
+            return new Laws(compilation, profile, contracts.ToImmutable(), roots.ToImmutable());
         }
 
         private static IEnumerable<INamedTypeSymbol> SourceTypes(INamespaceOrTypeSymbol container)
@@ -63,8 +92,13 @@ namespace Dog.Laws
 
         public SemanticModel Model(SyntaxTree tree) => models.GetOrAdd(tree, t => Compilation.GetSemanticModel(t));
 
-        public IEnumerable<INamedTypeSymbol> Contracts(INamedTypeSymbol type) =>
-            type.AllInterfaces.Where(i => Same.Equals(i.OriginalDefinition, sim) || Same.Equals(i.OriginalDefinition, layer));
+        public IEnumerable<(INamedTypeSymbol Contract, Profile.RootInterface Root)> Contracts(INamedTypeSymbol type) =>
+            type.AllInterfaces
+                .Where(i => rootInterfaces.Any(r => Same.Equals(i.OriginalDefinition, r.TypeSymbol)))
+                .Select(i => (i, rootInterfaces.First(r => Same.Equals(i.OriginalDefinition, r.TypeSymbol))));
+
+        private IEnumerable<INamedTypeSymbol> ContractsOf(INamedTypeSymbol type) =>
+            type.AllInterfaces.Where(i => rootInterfaces.Any(r => Same.Equals(i.OriginalDefinition, r.TypeSymbol)));
 
         public bool IsSimOrLayer(INamedTypeSymbol type) => Contracts(type).Any();
 
@@ -72,10 +106,10 @@ namespace Dog.Laws
 
         public bool IsEngineObject(ITypeSymbol type)
         {
-            if (engineObject == null) return false;
+            if (engineObjects.Length == 0) return false;
             for (var t = type; t != null; t = t.BaseType)
             {
-                if (Same.Equals(t, engineObject)) return true;
+                if (engineObjects.Any(e => Same.Equals(t, e))) return true;
             }
             return false;
         }
@@ -130,8 +164,8 @@ namespace Dog.Laws
         {
             if (method.Name != "Step") return false;
             var owner = method.ContainingType;
-            if (Same.Equals(owner.OriginalDefinition, sim) || Same.Equals(owner.OriginalDefinition, layer)) return true;
-            foreach (var contract in Contracts(owner))
+            if (contracts.Any(c => Same.Equals(owner.OriginalDefinition, c))) return true;
+            foreach (var (contract, _) in Contracts(owner))
             {
                 foreach (var step in contract.GetMembers("Step"))
                 {
@@ -141,6 +175,10 @@ namespace Dog.Laws
             return false;
         }
 
+        private bool MarkedPure(ISymbol symbol) =>
+            attributeTypes.Value.Count > 0 &&
+            symbol.GetAttributes().Any(a => a.AttributeClass != null && attributeTypes.Value.Contains(a.AttributeClass));
+
         public void CheckType(SymbolAnalysisContext context)
         {
             var type = (INamedTypeSymbol)context.Symbol;
@@ -148,32 +186,42 @@ namespace Dog.Laws
             CheckLog(context, type);
             CheckProject(context, type);
             if (type.IsAbstract || type.TypeKind == TypeKind.Interface) return;
-            foreach (var contract in Contracts(type))
+            foreach (var (contract, root) in Contracts(type))
             {
-                var isSim = Same.Equals(contract.OriginalDefinition, sim);
-                new DataCheck(this, SimLawsAnalyzer.StateIsData, isSim ? "state" : "memory", type, context.ReportDiagnostic).Run(contract.TypeArguments[0]);
-                new DataCheck(this, SimLawsAnalyzer.CommandsAreData, isSim ? "command" : "input", type, context.ReportDiagnostic).Run(contract.TypeArguments[1]);
-                var roots = isSim ? new[] { "Step" } : new[] { "Step", "Out" };
+                var isSim = root.Kind == "sim";
+                new DataCheck(this, SimLawsAnalyzer.StateIsData, isSim ? "state" : "memory", type, context.ReportDiagnostic).Run(contract.TypeArguments[root.StateArgument]);
+                new DataCheck(this, SimLawsAnalyzer.CommandsAreData, isSim ? "command" : "input", type, context.ReportDiagnostic).Run(contract.TypeArguments[root.CommandArgument]);
                 var check = new StepCheck(this, type, context.ReportDiagnostic);
-                foreach (var root in roots)
+                foreach (var rootMethod in root.Methods)
                 {
-                    foreach (var member in contract.GetMembers(root))
+                    foreach (var member in contract.GetMembers(rootMethod))
                     {
-                        if (type.FindImplementationForInterfaceMember(member) is IMethodSymbol impl) check.Run(impl, root);
+                        if (type.FindImplementationForInterfaceMember(member) is IMethodSymbol impl) check.Run(impl, rootMethod);
                     }
                 }
             }
         }
 
+        public void CheckMethod(SymbolAnalysisContext context)
+        {
+            var method = (IMethodSymbol)context.Symbol;
+            if (!MarkedPure(method)) return;
+            var owner = method.ContainingType;
+            if (InContract(method) || (owner != null && InContract(owner))) return;
+            new StepCheck(this, owner ?? method.ContainingType, context.ReportDiagnostic).Run(method, method.Name);
+        }
+
         private void CheckProject(SymbolAnalysisContext context, INamedTypeSymbol type)
         {
             if (shellBase == null || !Inherits(type, shellBase)) return;
-            foreach (var project in type.GetMembers("Project").OfType<IMethodSymbol>().Where(m => m.IsOverride))
+            var method = Profile.ProjectMethod ?? "Project";
+            foreach (var project in type.GetMembers(method).OfType<IMethodSymbol>().Where(m => m.IsOverride))
                 new ProjectCheck(this, type, shellBase, context.ReportDiagnostic).Run(project);
         }
 
         private void CheckLog(SymbolAnalysisContext context, INamedTypeSymbol type)
         {
+            if (Profile.MutableSequences.Count == 0) return;
             foreach (var (member, memberType) in StoredMembers(type))
             {
                 if (!IsMutableSequence(memberType, out var element) || !IsBatch(element, out var command)) continue;
@@ -195,21 +243,11 @@ namespace Dog.Laws
             }
         }
 
-        private static readonly ImmutableHashSet<string> MutableSequences = ImmutableHashSet.Create(
-            "System.Collections.Generic.List<T>", "System.Collections.Generic.Queue<T>", "System.Collections.Generic.Stack<T>",
-            "System.Collections.Generic.LinkedList<T>", "System.Collections.Generic.IList<T>", "System.Collections.Generic.ICollection<T>",
-            "System.Collections.ObjectModel.Collection<T>", "System.Collections.ObjectModel.ObservableCollection<T>");
-
-        private static readonly ImmutableHashSet<string> Batches = ImmutableHashSet.Create(
-            "System.Collections.Generic.IReadOnlyList<T>", "System.Collections.Generic.IReadOnlyCollection<T>", "System.Collections.Generic.IEnumerable<T>",
-            "System.Collections.Generic.List<T>", "System.Collections.Generic.IList<T>", "System.Collections.Generic.ICollection<T>",
-            "System.Collections.Immutable.ImmutableArray<T>", "System.Collections.Immutable.ImmutableList<T>", "System.Collections.Immutable.IImmutableList<T>");
-
-        private static bool IsMutableSequence(ITypeSymbol type, out ITypeSymbol element)
+        private bool IsMutableSequence(ITypeSymbol type, out ITypeSymbol element)
         {
             element = type;
             if (type is IArrayTypeSymbol array) { element = array.ElementType; return true; }
-            if (type is INamedTypeSymbol named && named.IsGenericType && MutableSequences.Contains(named.OriginalDefinition.ToDisplayString()))
+            if (type is INamedTypeSymbol named && named.IsGenericType && Profile.MutableSequences.Contains(named.OriginalDefinition.ToDisplayString()))
             {
                 element = named.TypeArguments[0];
                 return true;
@@ -217,11 +255,11 @@ namespace Dog.Laws
             return false;
         }
 
-        private static bool IsBatch(ITypeSymbol type, out ITypeSymbol command)
+        private bool IsBatch(ITypeSymbol type, out ITypeSymbol command)
         {
             command = type;
             if (type is IArrayTypeSymbol array) { command = array.ElementType; return true; }
-            if (type is INamedTypeSymbol named && named.IsGenericType && Batches.Contains(named.OriginalDefinition.ToDisplayString()))
+            if (type is INamedTypeSymbol named && named.IsGenericType && Profile.Batches.Contains(named.OriginalDefinition.ToDisplayString()))
             {
                 command = named.TypeArguments[0];
                 return true;
@@ -231,6 +269,7 @@ namespace Dog.Laws
 
         public void CheckWriteBack(OperationAnalysisContext context)
         {
+            if (rootInterfaces.Length == 0) return;
             var owner = context.ContainingSymbol as INamedTypeSymbol ?? context.ContainingSymbol.ContainingType;
             if (owner == null || InContract(owner) || IsShell(owner) || IsSimOrLayer(owner)) return;
             var where = context.ContainingSymbol.Name;

@@ -1,0 +1,27 @@
+{
+  "name": "dotnet-pure",
+  "language": "csharp",
+  "diagnostics": {
+    "step-is-pure": "DOG003"
+  },
+  "roots": {
+    "attributes": ["Pure", "System.Diagnostics.Contracts.Pure"]
+  },
+  "hidden": {
+    "clock": [
+      "System.DateTime.Now", "System.DateTime.UtcNow", "System.DateTime.Today",
+      "System.DateTimeOffset.Now", "System.DateTimeOffset.UtcNow",
+      "System.Diagnostics.Stopwatch.", "System.Environment.Tick"
+    ],
+    "random": ["System.Guid.NewGuid", "System.Random."],
+    "io": [
+      "System.IO.", "System.Console.", "System.Environment", "System.Diagnostics.Process"
+    ],
+    "global": [],
+    "engine": [],
+    "thread": ["System.Net.", "System.Threading.", "System.Threading.Tasks."]
+  },
+  "data": {},
+  "shell": { "stepCalls": [] },
+  "projection": { "readBack": false }
+}

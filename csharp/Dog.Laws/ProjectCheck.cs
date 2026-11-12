@@ -94,7 +94,8 @@ namespace Dog.Laws
                     else if (Own(f.ContainingType)) Say(field, $"touches the field {f.Name} of the shell itself", via, HiddenFix);
                     break;
                 case IObjectCreationOperation creation when creation.Type != null:
-                    if (creation.Type.ToDisplayString() == "System.Random") Say(creation, "creates System.Random", via, RandomFix);
+                    var made = creation.Type.ToDisplayString();
+                    if (laws.Profile.HiddenOf("random").Any(p => made.StartsWith(p.TrimEnd('.'), StringComparison.Ordinal))) Say(creation, $"creates {made}", via, RandomFix);
                     if (creation.Constructor != null) Follow(creation.Constructor, via);
                     break;
             }
@@ -135,16 +136,23 @@ namespace Dog.Laws
             {
                 Say(at, $"{verb} {member.Name} of the shell itself", via, HiddenFix);
             }
-            else if (space == "UnityEngine" && type.Name == "Time"
-                || (type.SpecialType == SpecialType.System_DateTime || name.StartsWith("System.DateTimeOffset.")) && (member.Name == "Now" || member.Name == "UtcNow" || member.Name == "Today")
-                || name.StartsWith("System.Diagnostics.Stopwatch.") || name.StartsWith("System.Environment.Tick"))
+            else if (Hidden("clock", name, space))
             {
                 Say(at, $"{verb} {name}", via, ClockFix);
             }
-            else if (space == "UnityEngine" && type.Name == "Random" || name == "System.Guid.NewGuid" || name.StartsWith("System.Random."))
+            else if (Hidden("random", name, space))
             {
                 Say(at, $"{verb} {name}", via, RandomFix);
             }
+        }
+
+        private bool Hidden(string category, string memberName, string space)
+        {
+            foreach (var pattern in laws.Profile.HiddenOf(category))
+            {
+                if (memberName.StartsWith(pattern, StringComparison.Ordinal)) return true;
+            }
+            return false;
         }
 
         private void Follow(IMethodSymbol method, string via)

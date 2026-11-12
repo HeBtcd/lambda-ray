@@ -8,31 +8,9 @@ namespace Dog.Laws
 {
     internal sealed class DataCheck
     {
-        private static readonly ImmutableHashSet<string> Unordered = ImmutableHashSet.Create(
-            "System.Collections.Generic.Dictionary<TKey, TValue>", "System.Collections.Generic.HashSet<T>",
-            "System.Collections.Generic.IDictionary<TKey, TValue>", "System.Collections.Generic.IReadOnlyDictionary<TKey, TValue>",
-            "System.Collections.Generic.ISet<T>", "System.Collections.Generic.IReadOnlySet<T>",
-            "System.Collections.Concurrent.ConcurrentDictionary<TKey, TValue>", "System.Collections.Concurrent.ConcurrentBag<T>",
-            "System.Collections.Immutable.ImmutableDictionary<TKey, TValue>", "System.Collections.Immutable.ImmutableHashSet<T>",
-            "System.Collections.Immutable.IImmutableDictionary<TKey, TValue>", "System.Collections.Immutable.IImmutableSet<T>",
-            "System.Collections.Hashtable");
-
-        private static readonly ImmutableHashSet<string> Mutable = ImmutableHashSet.Create(
-            "System.Collections.Generic.List<T>", "System.Collections.Generic.Queue<T>", "System.Collections.Generic.Stack<T>",
-            "System.Collections.Generic.LinkedList<T>", "System.Collections.Generic.SortedList<TKey, TValue>",
-            "System.Collections.Generic.SortedDictionary<TKey, TValue>", "System.Collections.Generic.SortedSet<T>",
-            "System.Collections.Generic.IList<T>", "System.Collections.Generic.ICollection<T>",
-            "System.Collections.ObjectModel.Collection<T>", "System.Collections.ObjectModel.ObservableCollection<T>",
-            "System.Collections.ArrayList", "System.Collections.IList", "System.Text.StringBuilder");
-
-        private static readonly ImmutableHashSet<string> ReadOnly = ImmutableHashSet.Create(
-            "System.Collections.Generic.IReadOnlyList<T>", "System.Collections.Generic.IReadOnlyCollection<T>",
-            "System.Collections.Generic.IEnumerable<T>", "System.Collections.Generic.KeyValuePair<TKey, TValue>",
-            "System.Collections.Immutable.ImmutableArray<T>", "System.Collections.Immutable.ImmutableList<T>",
-            "System.Collections.Immutable.IImmutableList<T>", "System.Collections.Immutable.ImmutableQueue<T>",
-            "System.Collections.Immutable.ImmutableStack<T>", "System.Collections.Immutable.ImmutableSortedSet<T>",
-            "System.Collections.Immutable.ImmutableSortedDictionary<TKey, TValue>", "System.Nullable<T>",
-            "System.Collections.ObjectModel.ReadOnlyCollection<T>", "Dog.Sim.Log<T>");
+        private ImmutableHashSet<string> Unordered => laws.Profile.Unordered;
+        private ImmutableHashSet<string> Mutable => laws.Profile.Mutable;
+        private ImmutableHashSet<string> ReadOnly => laws.Profile.ReadOnly;
 
         private readonly Laws laws;
         private readonly DiagnosticDescriptor rule;

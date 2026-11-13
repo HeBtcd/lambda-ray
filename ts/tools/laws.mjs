@@ -240,7 +240,14 @@ export function checkLaws({ root, files, profile } = {}) {
     const args = type.aliasTypeArguments ?? checker.getTypeArguments(type);
     return args.length === arity ? args : null;
   }
-  const simOf = (node) => typeOf(node, 'Sim', 2, kernelModule);
+  const simIfaces = (roots.interfaces ?? []).filter((i) => i.kind === 'sim');
+  const simOf = (node) => {
+    for (const sim of simIfaces) {
+      const args = typeOf(node, sim.type, 2, sim.module ?? kernelModule);
+      if (args) return args;
+    }
+    return null;
+  };
   const layerOf = (node) => {
     const layer = (roots.interfaces ?? []).find((i) => i.kind === 'layer');
     return layer ? typeOf(node, layer.type, 3, layer.module ?? kernelModule) : null;
@@ -269,7 +276,8 @@ export function checkLaws({ root, files, profile } = {}) {
           const label = `the layer at ${where(node)}`;
           for (const problem of dataProblems(memory, checker.typeToString(memory))) report('state-is-data', node, `${problem.path} is ${problem.what}`, [label]);
           for (const problem of dataProblems(input, checker.typeToString(input))) report('commands-are-data', node, `${problem.path} is ${problem.what}`, [label]);
-          for (const name of ['step', 'out']) {
+          const layerIface = (roots.interfaces ?? []).find((i) => i.kind === 'layer');
+          for (const name of layerIface?.methods ?? ['step', 'out']) {
             const fn = functionOf(node, name);
             if (fn) checkStep(fn, `${name} of ${label}`);
           }
@@ -281,12 +289,16 @@ export function checkLaws({ root, files, profile } = {}) {
             const label = `the sim at ${where(node)}`;
             for (const problem of dataProblems(state, checker.typeToString(state))) report('state-is-data', node, `${problem.path} is ${problem.what}`, [label]);
             for (const problem of dataProblems(command, checker.typeToString(command))) report('commands-are-data', node, `${problem.path} is ${problem.what}`, [label]);
-            const step = node.properties.find((property) => property.name?.getText() === 'step');
-            const fn = step && (ts.isMethodDeclaration(step) ? step : ts.isPropertyAssignment(step) && isFunctionLike(step.initializer) ? step.initializer : null);
-            if (fn) checkStep(fn, `step of ${label}`);
-            else if (step && ts.isPropertyAssignment(step)) {
-              const body = bodyOf(checker.getSymbolAtLocation(step.initializer));
-              if (body) checkStep(body, `step of ${label}`);
+            const simIface = (roots.interfaces ?? []).find((i) => i.kind === 'sim');
+            const methodNames = simIface?.methods ?? ['step'];
+            for (const name of methodNames) {
+              const member = node.properties.find((property) => property.name?.getText() === name);
+              const fn = member && (ts.isMethodDeclaration(member) ? member : ts.isPropertyAssignment(member) && isFunctionLike(member.initializer) ? member.initializer : null);
+              if (fn) checkStep(fn, `${name} of ${label}`);
+              else if (member && ts.isPropertyAssignment(member)) {
+                const body = bodyOf(checker.getSymbolAtLocation(member.initializer));
+                if (body) checkStep(body, `${name} of ${label}`);
+              }
             }
           }
         }

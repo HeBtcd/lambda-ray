@@ -244,7 +244,7 @@ export function checkLaws({ root, files, profile } = {}) {
   const simOf = (node) => {
     for (const sim of simIfaces) {
       const args = typeOf(node, sim.type, 2, sim.module ?? kernelModule);
-      if (args) return args;
+      if (args) return { args, iface: sim };
     }
     return null;
   };
@@ -283,13 +283,13 @@ export function checkLaws({ root, files, profile } = {}) {
           }
         }
         if (ts.isObjectLiteralExpression(node)) {
-          const args = simOf(node);
-          if (args) {
+          const hit = simOf(node);
+          if (hit) {
+            const { args, iface: simIface } = hit;
             const [state, command] = args;
             const label = `the sim at ${where(node)}`;
             for (const problem of dataProblems(state, checker.typeToString(state))) report('state-is-data', node, `${problem.path} is ${problem.what}`, [label]);
             for (const problem of dataProblems(command, checker.typeToString(command))) report('commands-are-data', node, `${problem.path} is ${problem.what}`, [label]);
-            const simIface = (roots.interfaces ?? []).find((i) => i.kind === 'sim');
             const methodNames = simIface?.methods ?? ['step'];
             for (const name of methodNames) {
               const member = node.properties.find((property) => property.name?.getText() === name);

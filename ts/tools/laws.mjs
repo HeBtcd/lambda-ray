@@ -18,6 +18,7 @@ export const LAWS = {
   'data-enters-through-schema': 'data in a JSON file reaches the code only through load(source, schema, data)',
   'project-never-writes-back': 'what draws the state never steps the sim and never writes into the state; it sends commands',
   'is-pure': 'a pure function reads only its arguments and returns a new value: no clock, no randomness, no IO, no hidden state, no writes to anything it did not create',
+  'adapter-needs-synctest': 'a sanctioned impure-inside adapter must be covered by a test whose name contains "synctest", proving it resumes deterministically',
 };
 
 const FIX = {
@@ -28,6 +29,7 @@ const FIX = {
   'data-enters-through-schema': "import { load } from 'src/depot/schema' and pass the imported data through load with a schema",
   'project-never-writes-back': 'read the state useSim returns and send changes through the read() commands',
   'is-pure': 'move the effect out of the function: read the clock, draw the random or touch IO in the caller, and pass what the function needs as arguments',
+  'adapter-needs-synctest': 'add a test whose name contains "synctest" that resumes a fold over the adapter and matches straight play',
 };
 
 const posix = (path) => path.split(sep).join('/');
@@ -72,6 +74,10 @@ export function checkLaws({ root, files, profile } = {}) {
   const OPAQUE = new Set(data.opaque ?? []);
   const SHELLS = new Set(shell.exempt ?? []);
   const STEP_CALLS = new Set(shell.stepCalls ?? []);
+  // Sanctioned impure-inside adapters: step may call them, the check does not
+  // look inside, but each must be covered by a test whose name contains
+  // "synctest" — the proof that the adapter is deterministic under resume.
+  const ADAPTERS = (p.adapters ?? []).map((a) => ({ module: a.module, function: a.function }));
   const LOG_WRITE = /\blog\.(length\s*=[^=]|splice\(|pop\(|shift\(|unshift\(|reverse\(|sort\()|\blog\[[^\]]+\]\s*=[^=]/;
   const kernelModule = (roots.interfaces ?? []).find((i) => i.kind === 'sim')?.module ?? KERNEL;
   const depotModule = shell.loader?.module ?? DEPOT;
@@ -188,6 +194,19 @@ export function checkLaws({ root, files, profile } = {}) {
     return 'a function';
   };
 
+  // An adapter matches when the called symbol resolves to `function` exported
+  // from `module` (a repo-relative path). Calls into it are sanctioned: the
+  // step-is-pure walk stops at the boundary and the impure inside is trusted
+  // to the adapter's synctest proof instead.
+  const adapterOf = (symbol) => {
+    const target = resolved(symbol);
+    const file = declarationFile(target);
+    if (!file) return null;
+    const path = rel(file);
+    return ADAPTERS.find((a) => a.module === path && target?.getName() === a.function) ?? null;
+  };
+  const adaptersUsed = new Set();
+
   function checkStep(step, label, law = 'step-is-pure') {
     const visited = new Set();
     const queue = [{ fn: step, via: [label] }];
@@ -214,8 +233,13 @@ export function checkLaws({ root, files, profile } = {}) {
           if (ts.isPropertyAccessExpression(callee) && MUTATORS.has(callee.name.text) && !ownedBy(rootOf(callee.expression), fn)) impure(node, `calls ${callee.name.text} on ${rootOf(callee.expression).getText()}, which step did not create`);
           if (ts.isPropertyAccessExpression(callee) && callee.expression.getText() === 'Object' && OBJECT_MUTATORS.has(callee.name.text) && node.arguments[0] && !ownedBy(rootOf(node.arguments[0]), fn)) impure(node, `writes into ${node.arguments[0].getText()} with Object.${callee.name.text}`);
           const symbol = checker.getSymbolAtLocation(ts.isPropertyAccessExpression(callee) ? callee.name : callee);
-          const body = bodyOf(symbol);
-          if (body && !visited.has(body)) queue.push({ fn: body, via: [...via, `${nameOf(body)} (${where(body)})`] });
+          const adapter = adapterOf(symbol);
+          if (adapter) {
+            adaptersUsed.add(adapter);
+          } else {
+            const body = bodyOf(symbol);
+            if (body && !visited.has(body)) queue.push({ fn: body, via: [...via, `${nameOf(body)} (${where(body)})`] });
+          }
         }
         ts.forEachChild(node, visit);
       };
@@ -347,6 +371,23 @@ export function checkLaws({ root, files, profile } = {}) {
     }
   }
   for (const { fn, label } of pureRoots) checkStep(fn, label, 'is-pure');
+
+  // Every sanctioned adapter that step actually reached must be covered by a
+  // test whose name contains "synctest". A plain-text search of the test
+  // files is enough — the coverage claim is a name, not an import.
+  const testSources = candidates.filter((path) => isTest(path)).map((path) => readFileSync(path, 'utf8'));
+  for (const adapter of adaptersUsed) {
+    const covered = testSources.some((text) => /synctest/i.test(text) && text.includes(adapter.function));
+    if (!covered) {
+      violations.push({
+        law: 'adapter-needs-synctest',
+        at: `${adapter.module}:1:1`,
+        message: `${adapter.function} in ${adapter.module} is a sanctioned impure-inside adapter but no test file names it inside a "synctest" test`,
+        via: [],
+        fix: FIX['adapter-needs-synctest'],
+      });
+    }
+  }
 
   const seen = new Set();
   return violations.filter((violation) => {

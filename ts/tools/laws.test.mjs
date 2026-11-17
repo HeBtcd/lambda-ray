@@ -2,7 +2,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { checkLaws, DEPOT, KERNEL, LAWS } from './laws.mjs';
+import { checkLaws, DEPOT, KERNEL, LAWS, loadProfile } from './laws.mjs';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 const SIM = "import type { Sim } from '../sim/sim';\n";
@@ -69,6 +69,22 @@ export const engine: Sim<{ readonly t: number }, never> = { stepsPerSecond: 60, 
 `,
   'src/game/loose.ts': `import data from './raw.json';
 export const SPEED = data.speed;
+`,
+  'src/game/adapter.ts': `let hidden = 0;
+export const sanctionedEngine = (x: number): number => { hidden++; return x + hidden; };
+`,
+  'src/game/stepvia.ts': `import type { Sim } from '../sim/sim';
+import { sanctionedEngine } from './adapter';
+export const via: Sim<{ readonly n: number }, never> = { stepsPerSecond: 60, init: { n: 0 }, step: (state) => ({ n: sanctionedEngine(state.n) }) };
+`,
+  'src/game/unsanctioned.ts': `import type { Sim } from '../sim/sim';
+const impure = (x: number): number => x + hiddenCalls();
+const hiddenCalls = () => { counter++; return counter; };
+let counter = 0;
+export const bad: Sim<{ readonly n: number }, never> = { stepsPerSecond: 60, init: { n: 0 }, step: (state) => ({ n: impure(state.n) }) };
+`,
+  'src/game/synctest.test.ts': `// proof the adapter resumes deterministically
+it('sanctionedEngine synctest', () => {});
 `,
   'src/game/view.tsx': `import { stepOnce } from '../sim/sim';
 import { good } from './good';
@@ -154,6 +170,35 @@ describe('the laws', () => {
 
   it('give every violation its law and a fix', () => {
     expect(found.every((violation) => LAWS[violation.law] && violation.fix)).toBe(true);
+  });
+
+  it('refuse a call into an impure helper the profile does not sanction', () => {
+    expect(lawsIn('src/game/unsanctioned.ts')).toEqual(['step-is-pure']);
+  });
+});
+
+describe('sanctioned adapters', () => {
+  const profile = loadProfile('ts-fold');
+  const withAdapters = (adapters) => ({ ...profile, adapters });
+
+  it('pass a step that calls a sanctioned adapter when a synctest covers it', () => {
+    const violations = checkLaws({ root, profile: withAdapters([{ module: 'src/game/adapter.ts', function: 'sanctionedEngine' }]) });
+    expect(violations.filter((v) => v.at.startsWith('src/game/stepvia.ts') || v.at.startsWith('src/game/adapter.ts'))).toEqual([]);
+  });
+
+  it('fail with a clear message when the synctest coverage is missing', () => {
+    const violations = checkLaws({ root, profile: withAdapters([{ module: 'src/game/adapter.ts', function: 'sanctionedEngine' }]), files: [join(root, 'src/game/stepvia.ts'), join(root, 'src/game/adapter.ts')] });
+    const misses = violations.filter((v) => v.law === 'adapter-needs-synctest');
+    expect(misses.length).toBe(1);
+    expect(misses[0].message).toMatch(/sanctionedEngine/);
+    expect(misses[0].message).toMatch(/synctest/);
+  });
+
+  it('still follow step into impure helpers that are not sanctioned', () => {
+    const violations = checkLaws({ root, profile: withAdapters([{ module: 'src/game/adapter.ts', function: 'sanctionedEngine' }]) });
+    const bad = violations.filter((v) => v.at.startsWith('src/game/unsanctioned.ts'));
+    expect(bad.map((v) => v.law)).toEqual(['step-is-pure', 'step-is-pure', 'step-is-pure']);
+    expect(bad[0].via.join(' ')).toMatch(/impure|hiddenCalls/);
   });
 });
 

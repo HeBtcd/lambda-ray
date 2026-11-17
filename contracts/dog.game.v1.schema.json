@@ -21,7 +21,12 @@
     "request": {
       "oneOf": [
         { "type": "object", "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "hello" } } },
-        { "type": "object", "required": ["op", "seed"], "additionalProperties": false, "properties": { "op": { "const": "reset" }, "seed": { "$ref": "#/$defs/seed" } } },
+        {
+          "type": "object",
+          "required": ["op", "seed"],
+          "additionalProperties": false,
+          "properties": { "op": { "const": "reset" }, "seed": { "$ref": "#/$defs/seed" }, "checkpoint_every": { "type": "integer", "minimum": 1 } }
+        },
         { "type": "object", "required": ["op", "commands"], "additionalProperties": false, "properties": { "op": { "const": "step" }, "commands": { "$ref": "#/$defs/batch" } } },
         { "type": "object", "required": ["op", "ticks"], "additionalProperties": false, "properties": { "op": { "const": "run" }, "ticks": { "type": "array", "items": { "$ref": "#/$defs/batch" } } } },
         { "type": "object", "required": ["op", "tick"], "additionalProperties": false, "properties": { "op": { "const": "seek" }, "tick": { "type": "integer", "minimum": 0 } } },
@@ -57,7 +62,8 @@
         "steps_per_second": { "type": "integer", "minimum": 1 },
         "actions": { "type": "array", "items": { "$ref": "#/$defs/command" } },
         "assertions": { "type": "array", "items": { "type": "string" } },
-        "goals": { "type": "array", "items": { "type": "string" } }
+        "goals": { "type": "array", "items": { "type": "string" } },
+        "state_version": { "type": ["string", "null"] }
       }
     },
     "tickReply": {
@@ -69,7 +75,9 @@
         "hash": { "$ref": "#/$defs/hash" },
         "obs": {},
         "cell": { "type": "string" },
-        "cost": { "$ref": "#/$defs/cost" }
+        "cost": { "$ref": "#/$defs/cost" },
+        "state_version": { "type": ["string", "null"] },
+        "migrated": { "$ref": "#/$defs/migrated" }
       }
     },
     "runReply": {
@@ -115,6 +123,11 @@
       "required": ["ok", "tick", "manifest"],
       "properties": { "ok": { "const": true }, "tick": { "type": "integer" }, "manifest": { "type": "string" } }
     },
+    "migrated": {
+      "type": "object",
+      "required": ["from", "to"],
+      "properties": { "from": { "type": "string" }, "to": { "type": "string" } }
+    },
     "reloadReply": {
       "type": "object",
       "required": ["ok", "tick", "hash", "version", "diverged_at"],
@@ -123,7 +136,12 @@
         "tick": { "type": "integer" },
         "hash": { "$ref": "#/$defs/hash" },
         "version": { "type": "string" },
-        "diverged_at": { "type": ["integer", "null"] }
+        "diverged_at": { "type": ["integer", "null"] },
+        "state_version": { "type": ["string", "null"] },
+        "migrated": { "$ref": "#/$defs/migrated" },
+        "shape_changed": { "type": "boolean" },
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "paths_truncated": { "type": "boolean" }
       }
     },
     "error": {
@@ -135,7 +153,7 @@
           "type": "object",
           "required": ["kind", "message"],
           "properties": {
-            "kind": { "enum": ["crash", "unsupported", "usage", "diverged"] },
+            "kind": { "enum": ["crash", "unsupported", "usage", "diverged", "version"] },
             "message": { "type": "string" },
             "tick": { "type": "integer", "minimum": 0 }
           }

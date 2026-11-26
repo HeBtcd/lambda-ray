@@ -1,0 +1,37 @@
+{
+  "name": "lambda-ray",
+  "version": "0.2.0",
+  "description": "Zero-execution deterministic static code X-ray for .ts/.js, .cpp, .cs, and .rs. Extracts structural facts (non-local reads, writes, calls, subscripts, and control escapes) without verdicts or heuristics.",
+  "type": "module",
+  "bin": {
+    "lambda-ray": "./src/js/ray.js"
+  },
+  "exports": {
+    ".": "./src/js/ray.js"
+  },
+  "files": [
+    "src/",
+    "skills/"
+  ],
+  "repository": "github:HeBtcd/lambda-ray",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "keywords": [
+    "ai-agent",
+    "static-analysis",
+    "xray",
+    "ast",
+    "typescript",
+    "javascript",
+    "cpp",
+    "csharp",
+    "rust"
+  ],
+  "dependencies": {
+    "typescript": "^5.9.0"
+  }
+}

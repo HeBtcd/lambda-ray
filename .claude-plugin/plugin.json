@@ -1,0 +1,6 @@
+{
+  "name": "lambda-ray",
+  "version": "0.2.0",
+  "description": "Zero-execution deterministic static code X-ray for .ts/.js, .cpp, .cs, and .rs. Extracts structural facts per function without heuristic verdicts.",
+  "skills": "./skills/"
+}

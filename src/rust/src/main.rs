@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process;
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
+use syn::visit::{self, Visit};
 use syn::{
     BinOp, Block, Expr, ExprCall, ExprClosure, ExprField, ExprMethodCall, ExprPath, FnArg,
     ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemTrait, Local, Macro, Member, Pat, Path,
@@ -20,6 +21,72 @@ struct RayOutput {
     file: String,
     language: &'static str,
     functions: Vec<FunctionBucket>,
+    declarations: Vec<DeclarationFact>,
+    comments: CommentsInfo,
+    imports: Vec<ImportFact>,
+    hazards: Vec<HazardFact>,
+    syntax_kinds: Vec<SyntaxKindFact>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FnMetrics {
+    lines: usize,
+    branches: usize,
+    max_nesting: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeclarationFact {
+    kind: &'static str,
+    name: String,
+    bases: Vec<String>,
+    modifiers: Vec<&'static str>,
+    line: usize,
+    col: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentSpan {
+    kind: &'static str,
+    line: usize,
+    end_line: usize,
+    col: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentsInfo {
+    count: usize,
+    spans: Vec<CommentSpan>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportFact {
+    source: String,
+    kind: &'static str,
+    line: usize,
+    col: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HazardFact {
+    kind: &'static str,
+    detail: String,
+    line: usize,
+    col: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyntaxKindFact {
+    kind: &'static str,
+    line: usize,
+    col: usize,
 }
 
 #[derive(Serialize)]
@@ -29,6 +96,7 @@ struct FunctionBucket {
     line: usize,
     col: usize,
     params: Vec<String>,
+    metrics: FnMetrics,
     reads: Vec<ReadFact>,
     writes: Vec<WriteFact>,
     calls: Vec<CallFact>,
@@ -767,7 +835,8 @@ impl<'a> FnContext<'a> {
             collect_pat_bindings(pat, &mut param_frame);
         }
 
-        let bucket = empty_bucket(name.clone(), line, col, params);
+        let metrics = compute_expr_metrics(&closure.body, line, node_end_lc(closure).map(|e| e.line).unwrap_or(line));
+        let bucket = empty_bucket(name.clone(), line, col, params, metrics);
         let mut child_ctx = FnContext {
             index: self.index,
             src: self.src,
@@ -1668,12 +1737,19 @@ impl<'a> FnContext<'a> {
     }
 }
 
-fn empty_bucket(name: String, line: usize, col: usize, params: Vec<String>) -> FunctionBucket {
+fn empty_bucket(
+    name: String,
+    line: usize,
+    col: usize,
+    params: Vec<String>,
+    metrics: FnMetrics,
+) -> FunctionBucket {
     FunctionBucket {
         name,
         line,
         col,
         params,
+        metrics,
         reads: Vec::new(),
         writes: Vec::new(),
         calls: Vec::new(),
@@ -1682,6 +1758,730 @@ fn empty_bucket(name: String, line: usize, col: usize, params: Vec<String>) -> F
         catches: Vec::new(),
         loops: Vec::new(),
         suspends: Vec::new(),
+    }
+}
+
+struct MetricsWalk {
+    branches: usize,
+    max_nesting: usize,
+    depth: usize,
+}
+
+impl MetricsWalk {
+    fn enter_nest<F: FnOnce(&mut Self)>(&mut self, f: F) {
+        self.depth += 1;
+        if self.depth > self.max_nesting {
+            self.max_nesting = self.depth;
+        }
+        f(self);
+        self.depth -= 1;
+    }
+}
+
+impl<'ast> Visit<'ast> for MetricsWalk {
+    fn visit_item(&mut self, _i: &'ast Item) {}
+
+    fn visit_expr_closure(&mut self, _e: &'ast ExprClosure) {}
+
+    fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
+        self.branches += 1;
+        self.visit_expr(&e.cond);
+        self.enter_nest(|w| w.visit_block(&e.then_branch));
+        if let Some((_, else_expr)) = &e.else_branch {
+            if matches!(&**else_expr, Expr::If(_)) {
+                self.visit_expr(else_expr);
+            } else {
+                self.enter_nest(|w| w.visit_expr(else_expr));
+            }
+        }
+    }
+
+    fn visit_expr_match(&mut self, e: &'ast syn::ExprMatch) {
+        self.visit_expr(&e.expr);
+        self.enter_nest(|w| {
+            for arm in &e.arms {
+                w.branches += 1;
+                if let Some((_, g)) = &arm.guard {
+                    w.visit_expr(g);
+                }
+                w.visit_expr(&arm.body);
+            }
+        });
+    }
+
+    fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
+        self.branches += 1;
+        self.visit_expr(&e.expr);
+        self.enter_nest(|w| w.visit_block(&e.body));
+    }
+
+    fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
+        self.branches += 1;
+        self.visit_expr(&e.cond);
+        self.enter_nest(|w| w.visit_block(&e.body));
+    }
+
+    fn visit_expr_loop(&mut self, e: &'ast syn::ExprLoop) {
+        self.branches += 1;
+        self.enter_nest(|w| w.visit_block(&e.body));
+    }
+}
+
+fn compute_block_metrics(block: &Block, start_line: usize, end_line: usize) -> FnMetrics {
+    let mut w = MetricsWalk {
+        branches: 0,
+        max_nesting: 0,
+        depth: 0,
+    };
+    for stmt in &block.stmts {
+        w.visit_stmt(stmt);
+    }
+    FnMetrics {
+        lines: end_line.saturating_sub(start_line) + 1,
+        branches: w.branches,
+        max_nesting: w.max_nesting,
+    }
+}
+
+fn compute_expr_metrics(expr: &Expr, start_line: usize, end_line: usize) -> FnMetrics {
+    let mut w = MetricsWalk {
+        branches: 0,
+        max_nesting: 0,
+        depth: 0,
+    };
+    w.visit_expr(expr);
+    FnMetrics {
+        lines: end_line.saturating_sub(start_line) + 1,
+        branches: w.branches,
+        max_nesting: w.max_nesting,
+    }
+}
+
+fn scan_rust_comments(raw: &str) -> CommentsInfo {
+    let b = raw.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let mut spans = Vec::new();
+
+    let advance_one = |idx: usize, ln: &mut usize, cl: &mut usize| -> usize {
+        if b[idx] == b'\n' {
+            *ln += 1;
+            *cl = 1;
+            idx + 1
+        } else {
+            let ch_len = raw[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            *cl += 1;
+            idx + ch_len
+        }
+    };
+
+    while i < n {
+        let c = b[i];
+        if (c == b'r' || (c == b'b' && i + 1 < n && b[i + 1] == b'r'))
+            && !((i > 0) && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let mut j = if c == b'b' { i + 2 } else { i + 1 };
+            let mut hashes = 0usize;
+            while j < n && b[j] == b'#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < n && b[j] == b'"' {
+                for _ in 0..(j + 1 - i) {
+                    i = advance_one(i, &mut line, &mut col);
+                }
+                while i < n {
+                    if b[i] == b'"' {
+                        let mut k = i + 1;
+                        let mut matched = 0usize;
+                        while matched < hashes && k < n && b[k] == b'#' {
+                            matched += 1;
+                            k += 1;
+                        }
+                        if matched == hashes {
+                            for _ in 0..(1 + hashes) {
+                                i = advance_one(i, &mut line, &mut col);
+                            }
+                            break;
+                        }
+                    }
+                    i = advance_one(i, &mut line, &mut col);
+                }
+                continue;
+            }
+        }
+
+        if c == b'"' || (c == b'b' && i + 1 < n && b[i + 1] == b'"') {
+            if c == b'b' {
+                i = advance_one(i, &mut line, &mut col);
+            }
+            i = advance_one(i, &mut line, &mut col);
+            while i < n {
+                if b[i] == b'\\' && i + 1 < n {
+                    i = advance_one(i, &mut line, &mut col);
+                    if i < n {
+                        i = advance_one(i, &mut line, &mut col);
+                    }
+                } else if b[i] == b'"' {
+                    i = advance_one(i, &mut line, &mut col);
+                    break;
+                } else {
+                    i = advance_one(i, &mut line, &mut col);
+                }
+            }
+            continue;
+        }
+
+        if c == b'\'' {
+            if i + 1 < n && b[i + 1] == b'\\' {
+                i = advance_one(i, &mut line, &mut col);
+                i = advance_one(i, &mut line, &mut col);
+                if i < n {
+                    i = advance_one(i, &mut line, &mut col);
+                }
+                while i < n && b[i] != b'\'' && b[i] != b'\n' {
+                    i = advance_one(i, &mut line, &mut col);
+                }
+                if i < n && b[i] == b'\'' {
+                    i = advance_one(i, &mut line, &mut col);
+                }
+                continue;
+            } else if i + 2 < n && b[i + 2] == b'\'' && b[i + 1] != b'\n' {
+                i = advance_one(i, &mut line, &mut col);
+                i = advance_one(i, &mut line, &mut col);
+                i = advance_one(i, &mut line, &mut col);
+                continue;
+            }
+        }
+
+        if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            let start_line = line;
+            let start_col = col;
+            while i < n && b[i] != b'\n' {
+                i = advance_one(i, &mut line, &mut col);
+            }
+            spans.push(CommentSpan {
+                kind: "line",
+                line: start_line,
+                end_line: start_line,
+                col: start_col,
+            });
+            continue;
+        }
+
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            let start_line = line;
+            let start_col = col;
+            let mut depth = 1usize;
+            i = advance_one(i, &mut line, &mut col);
+            i = advance_one(i, &mut line, &mut col);
+            while i < n && depth > 0 {
+                if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                    depth += 1;
+                    i = advance_one(i, &mut line, &mut col);
+                    i = advance_one(i, &mut line, &mut col);
+                } else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                    depth -= 1;
+                    i = advance_one(i, &mut line, &mut col);
+                    i = advance_one(i, &mut line, &mut col);
+                } else {
+                    i = advance_one(i, &mut line, &mut col);
+                }
+            }
+            spans.push(CommentSpan {
+                kind: "block",
+                line: start_line,
+                end_line: line,
+                col: start_col,
+            });
+            continue;
+        }
+
+        i = advance_one(i, &mut line, &mut col);
+    }
+
+    CommentsInfo {
+        count: spans.len(),
+        spans,
+    }
+}
+
+fn flatten_use_paths(tree: &UseTree, prefix: &mut Vec<String>, out: &mut Vec<String>) {
+    match tree {
+        UseTree::Path(p) => {
+            prefix.push(p.ident.to_string());
+            flatten_use_paths(&p.tree, prefix, out);
+            prefix.pop();
+        }
+        UseTree::Group(g) => {
+            for item in &g.items {
+                flatten_use_paths(item, prefix, out);
+            }
+        }
+        UseTree::Name(n) => {
+            let ident = n.ident.to_string();
+            if ident == "self" {
+                if !prefix.is_empty() {
+                    out.push(prefix.join("::"));
+                }
+            } else if prefix.is_empty() {
+                out.push(ident);
+            } else {
+                out.push(format!("{}::{}", prefix.join("::"), ident));
+            }
+        }
+        UseTree::Rename(r) => {
+            let orig = r.ident.to_string();
+            if orig == "self" {
+                if !prefix.is_empty() {
+                    out.push(prefix.join("::"));
+                }
+            } else if prefix.is_empty() {
+                out.push(orig);
+            } else {
+                out.push(format!("{}::{}", prefix.join("::"), orig));
+            }
+        }
+        UseTree::Glob(_) => {
+            if prefix.is_empty() {
+                out.push("*".to_string());
+            } else {
+                out.push(format!("{}::*", prefix.join("::")));
+            }
+        }
+    }
+}
+
+struct StructuralCollector<'a> {
+    src: &'a SourceText,
+    declarations: Vec<DeclarationFact>,
+    imports: Vec<ImportFact>,
+    hazards: Vec<HazardFact>,
+    syntax_kinds: Vec<SyntaxKindFact>,
+}
+
+impl<'a> StructuralCollector<'a> {
+    fn push_kind<T: ToTokens>(&mut self, kind: &'static str, node: &T) {
+        let (line, col) = loc_of_node(node);
+        self.syntax_kinds.push(SyntaxKindFact { kind, line, col });
+    }
+
+    fn push_kind_span(&mut self, kind: &'static str, span: Span) {
+        let (line, col) = loc_of_span(span);
+        self.syntax_kinds.push(SyntaxKindFact { kind, line, col });
+    }
+}
+
+impl<'ast, 'a> Visit<'ast> for StructuralCollector<'a> {
+    fn visit_item(&mut self, item: &'ast Item) {
+        let (line, col) = loc_of_node(item);
+        match item {
+            Item::Const(c) => {
+                self.push_kind("ItemConst", c);
+                self.declarations.push(DeclarationFact {
+                    kind: "variable",
+                    name: c.ident.to_string(),
+                    bases: Vec::new(),
+                    modifiers: vec!["module", "const"],
+                    line,
+                    col,
+                });
+            }
+            Item::Enum(e) => {
+                self.push_kind("ItemEnum", e);
+                self.declarations.push(DeclarationFact {
+                    kind: "enum",
+                    name: e.ident.to_string(),
+                    bases: Vec::new(),
+                    modifiers: Vec::new(),
+                    line,
+                    col,
+                });
+            }
+            Item::ExternCrate(ec) => {
+                self.push_kind("ItemExternCrate", ec);
+            }
+            Item::Fn(f) => {
+                self.push_kind("ItemFn", f);
+                if let Some(u) = &f.sig.unsafety {
+                    self.push_kind_span("UnsafeFn", u.span);
+                    self.hazards.push(HazardFact {
+                        kind: "unsafe",
+                        detail: format!("unsafe fn {}", f.sig.ident),
+                        line,
+                        col,
+                    });
+                }
+                if let Some(a) = &f.sig.asyncness {
+                    self.push_kind_span("AsyncFn", a.span);
+                }
+            }
+            Item::ForeignMod(fm) => {
+                self.push_kind("ItemForeignMod", fm);
+                self.hazards.push(HazardFact {
+                    kind: "unsafe",
+                    detail: "extern".to_string(),
+                    line,
+                    col,
+                });
+            }
+            Item::Impl(imp) => {
+                self.push_kind("ItemImpl", imp);
+                let owner = type_base_name(&imp.self_ty, self.src);
+                let trait_bases = imp
+                    .trait_
+                    .as_ref()
+                    .map(|(_, p, _)| vec![path_base_name(p)])
+                    .unwrap_or_default();
+                let mut mods = Vec::new();
+                if let Some(u) = &imp.unsafety {
+                    self.push_kind_span("UnsafeImpl", u.span);
+                    mods.push("unsafe");
+                    self.hazards.push(HazardFact {
+                        kind: "unsafe",
+                        detail: format!("unsafe impl {owner}"),
+                        line,
+                        col,
+                    });
+                }
+                self.declarations.push(DeclarationFact {
+                    kind: "impl",
+                    name: owner,
+                    bases: trait_bases,
+                    modifiers: mods,
+                    line,
+                    col,
+                });
+            }
+            Item::Macro(m) => {
+                self.push_kind("ItemMacro", m);
+                let mname = m
+                    .ident
+                    .as_ref()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| path_base_name(&m.mac.path));
+                self.declarations.push(DeclarationFact {
+                    kind: "macro",
+                    name: mname.clone(),
+                    bases: Vec::new(),
+                    modifiers: Vec::new(),
+                    line,
+                    col,
+                });
+                self.hazards.push(HazardFact {
+                    kind: "dynamic",
+                    detail: format!("macro {mname}"),
+                    line,
+                    col,
+                });
+            }
+            Item::Mod(m) => self.push_kind("ItemMod", m),
+            Item::Static(s) => {
+                let is_mut = matches!(s.mutability, StaticMutability::Mut(_));
+                self.push_kind(if is_mut { "ItemStaticMut" } else { "ItemStatic" }, s);
+                self.declarations.push(DeclarationFact {
+                    kind: "variable",
+                    name: s.ident.to_string(),
+                    bases: Vec::new(),
+                    modifiers: vec!["module", if is_mut { "mutable" } else { "static" }],
+                    line,
+                    col,
+                });
+            }
+            Item::Struct(s) => {
+                self.push_kind("ItemStruct", s);
+                self.declarations.push(DeclarationFact {
+                    kind: "struct",
+                    name: s.ident.to_string(),
+                    bases: Vec::new(),
+                    modifiers: Vec::new(),
+                    line,
+                    col,
+                });
+            }
+            Item::Trait(tr) => {
+                self.push_kind("ItemTrait", tr);
+                let mut mods = Vec::new();
+                if let Some(u) = &tr.unsafety {
+                    self.push_kind_span("UnsafeTrait", u.span);
+                    mods.push("unsafe");
+                    self.hazards.push(HazardFact {
+                        kind: "unsafe",
+                        detail: format!("unsafe trait {}", tr.ident),
+                        line,
+                        col,
+                    });
+                }
+                self.declarations.push(DeclarationFact {
+                    kind: "trait",
+                    name: tr.ident.to_string(),
+                    bases: Vec::new(),
+                    modifiers: mods,
+                    line,
+                    col,
+                });
+            }
+            Item::TraitAlias(ta) => self.push_kind("ItemTraitAlias", ta),
+            Item::Type(ty) => self.push_kind("ItemType", ty),
+            Item::Union(u) => {
+                self.push_kind("ItemUnion", u);
+                self.declarations.push(DeclarationFact {
+                    kind: "union",
+                    name: u.ident.to_string(),
+                    bases: Vec::new(),
+                    modifiers: Vec::new(),
+                    line,
+                    col,
+                });
+                self.hazards.push(HazardFact {
+                    kind: "unsafe",
+                    detail: format!("union {}", u.ident),
+                    line,
+                    col,
+                });
+            }
+            Item::Use(u) => {
+                self.push_kind("ItemUse", u);
+                let mut p = Vec::new();
+                let mut paths = Vec::new();
+                flatten_use_paths(&u.tree, &mut p, &mut paths);
+                for src in paths {
+                    self.imports.push(ImportFact {
+                        source: src,
+                        kind: "use",
+                        line,
+                        col,
+                    });
+                }
+            }
+            _ => {}
+        }
+        visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        if let ImplItem::Fn(m) = item {
+            let (line, col) = loc_of_node(m);
+            self.push_kind("ImplItemFn", m);
+            if let Some(u) = &m.sig.unsafety {
+                self.push_kind_span("UnsafeFn", u.span);
+                self.hazards.push(HazardFact {
+                    kind: "unsafe",
+                    detail: format!("unsafe fn {}", m.sig.ident),
+                    line,
+                    col,
+                });
+            }
+            if let Some(a) = &m.sig.asyncness {
+                self.push_kind_span("AsyncFn", a.span);
+            }
+        }
+        visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast TraitItem) {
+        if let TraitItem::Fn(m) = item {
+            let (line, col) = loc_of_node(m);
+            self.push_kind("TraitItemFn", m);
+            if let Some(u) = &m.sig.unsafety {
+                self.push_kind_span("UnsafeFn", u.span);
+                self.hazards.push(HazardFact {
+                    kind: "unsafe",
+                    detail: format!("unsafe fn {}", m.sig.ident),
+                    line,
+                    col,
+                });
+            }
+            if let Some(a) = &m.sig.asyncness {
+                self.push_kind_span("AsyncFn", a.span);
+            }
+        }
+        visit::visit_trait_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        match stmt {
+            Stmt::Local(l) => self.push_kind("StmtLocal", l),
+            Stmt::Item(i) => self.push_kind("StmtItem", i),
+            Stmt::Expr(e, _) => self.push_kind("StmtExpr", e),
+            Stmt::Macro(m) => self.push_kind("StmtMacro", m),
+        }
+        visit::visit_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        let (line, col) = loc_of_node(expr);
+        let k = match expr {
+            Expr::Array(_) => Some("ExprArray"),
+            Expr::Assign(_) => Some("ExprAssign"),
+            Expr::Async(_) => Some("ExprAsync"),
+            Expr::Await(_) => Some("ExprAwait"),
+            Expr::Binary(_) => Some("ExprBinary"),
+            Expr::Block(_) => Some("ExprBlock"),
+            Expr::Break(_) => Some("ExprBreak"),
+            Expr::Call(c) => {
+                if let Expr::Path(ep) = unwrap_paren(&c.func) {
+                    let pname = path_base_name(&ep.path);
+                    if pname == "transmute" || pname.ends_with("::transmute") {
+                        self.hazards.push(HazardFact {
+                            kind: "unsafe",
+                            detail: pname,
+                            line,
+                            col,
+                        });
+                    }
+                }
+                Some("ExprCall")
+            }
+            Expr::Cast(_) => Some("ExprCast"),
+            Expr::Closure(_) => Some("ExprClosure"),
+            Expr::Const(_) => Some("ExprConst"),
+            Expr::Continue(_) => Some("ExprContinue"),
+            Expr::Field(_) => Some("ExprField"),
+            Expr::ForLoop(_) => Some("ExprForLoop"),
+            Expr::Group(_) => Some("ExprGroup"),
+            Expr::If(_) => Some("ExprIf"),
+            Expr::Index(_) => Some("ExprIndex"),
+            Expr::Let(_) => Some("ExprLet"),
+            Expr::Lit(_) => Some("ExprLit"),
+            Expr::Loop(_) => Some("ExprLoop"),
+            Expr::Macro(_) => Some("ExprMacro"),
+            Expr::Match(_) => Some("ExprMatch"),
+            Expr::MethodCall(_) => Some("ExprMethodCall"),
+            Expr::Paren(_) => Some("ExprParen"),
+            Expr::Path(_) => Some("ExprPath"),
+            Expr::Range(_) => Some("ExprRange"),
+            Expr::RawAddr(_) => {
+                self.hazards.push(HazardFact {
+                    kind: "unsafe",
+                    detail: "raw_addr".to_string(),
+                    line,
+                    col,
+                });
+                Some("ExprRawAddr")
+            }
+            Expr::Reference(_) => Some("ExprReference"),
+            Expr::Repeat(_) => Some("ExprRepeat"),
+            Expr::Return(_) => Some("ExprReturn"),
+            Expr::Struct(_) => Some("ExprStruct"),
+            Expr::Try(_) => Some("ExprTry"),
+            Expr::TryBlock(_) => Some("ExprTryBlock"),
+            Expr::Tuple(_) => Some("ExprTuple"),
+            Expr::Unary(_) => Some("ExprUnary"),
+            Expr::Unsafe(_) => {
+                self.hazards.push(HazardFact {
+                    kind: "unsafe",
+                    detail: "unsafe".to_string(),
+                    line,
+                    col,
+                });
+                Some("ExprUnsafe")
+            }
+            Expr::While(_) => Some("ExprWhile"),
+            Expr::Yield(_) => Some("ExprYield"),
+            _ => None,
+        };
+        if let Some(kind) = k {
+            self.syntax_kinds.push(SyntaxKindFact { kind, line, col });
+        }
+        visit::visit_expr(self, expr);
+    }
+
+    fn visit_pat(&mut self, pat: &'ast Pat) {
+        let k = match pat {
+            Pat::Ident(_) => Some("PatIdent"),
+            Pat::Lit(_) => Some("PatLit"),
+            Pat::Or(_) => Some("PatOr"),
+            Pat::Paren(_) => Some("PatParen"),
+            Pat::Path(_) => Some("PatPath"),
+            Pat::Range(_) => Some("PatRange"),
+            Pat::Reference(_) => Some("PatReference"),
+            Pat::Rest(_) => Some("PatRest"),
+            Pat::Slice(_) => Some("PatSlice"),
+            Pat::Struct(_) => Some("PatStruct"),
+            Pat::Tuple(_) => Some("PatTuple"),
+            Pat::TupleStruct(_) => Some("PatTupleStruct"),
+            Pat::Type(_) => Some("PatType"),
+            Pat::Wild(_) => Some("PatWild"),
+            _ => None,
+        };
+        if let Some(kind) = k {
+            self.push_kind(kind, pat);
+        }
+        visit::visit_pat(self, pat);
+    }
+
+    fn visit_type(&mut self, ty: &'ast Type) {
+        let (line, col) = loc_of_node(ty);
+        let k = match ty {
+            Type::Array(_) => Some("TypeArray"),
+            Type::BareFn(_) => Some("TypeBareFn"),
+            Type::ImplTrait(_) => Some("TypeImplTrait"),
+            Type::Infer(_) => Some("TypeInfer"),
+            Type::Macro(_) => Some("TypeMacro"),
+            Type::Never(_) => Some("TypeNever"),
+            Type::Paren(_) => Some("TypeParen"),
+            Type::Path(tp) => {
+                let pname = path_base_name(&tp.path);
+                let last = tp
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                if pname == "std::any::Any" || pname == "core::any::Any" || pname == "std::any::TypeId" || last == "TypeId" {
+                    self.hazards.push(HazardFact {
+                        kind: "reflection",
+                        detail: pname,
+                        line,
+                        col,
+                    });
+                } else if matches!(last.as_str(), "Blackboard" | "GameplayTag" | "GameplayTagContainer" | "RefCell" | "Mutex" | "RwLock") {
+                    self.hazards.push(HazardFact {
+                        kind: "blackboard",
+                        detail: pname,
+                        line,
+                        col,
+                    });
+                } else if (last == "HashMap" || last == "BTreeMap") && self.src.slice_tokens(tp).contains("dyn Any") {
+                    self.hazards.push(HazardFact {
+                        kind: "blackboard",
+                        detail: self.src.slice_tokens(tp),
+                        line,
+                        col,
+                    });
+                }
+                Some("TypePath")
+            }
+            Type::Ptr(_) => {
+                self.hazards.push(HazardFact {
+                    kind: "unsafe",
+                    detail: self.src.slice_tokens(ty),
+                    line,
+                    col,
+                });
+                Some("TypePtr")
+            }
+            Type::Reference(_) => Some("TypeReference"),
+            Type::Slice(_) => Some("TypeSlice"),
+            Type::TraitObject(_) => {
+                self.hazards.push(HazardFact {
+                    kind: "dynamic",
+                    detail: self.src.slice_tokens(ty),
+                    line,
+                    col,
+                });
+                Some("TypeTraitObject")
+            }
+            Type::Tuple(_) => Some("TypeTuple"),
+            _ => None,
+        };
+        if let Some(kind) = k {
+            self.syntax_kinds.push(SyntaxKindFact { kind, line, col });
+        }
+        visit::visit_type(self, ty);
     }
 }
 
@@ -1849,7 +2649,9 @@ fn walk_signature_and_block(
     let mut local_fn_scopes = inherited_local_fns;
     local_fn_scopes.push(HashMap::new());
 
-    let bucket = empty_bucket(target.fn_name.clone(), target.line, target.col, params);
+    let end_line = node_end_lc(block).map(|e| e.line).unwrap_or(target.line);
+    let metrics = compute_block_metrics(block, target.line, end_line);
+    let bucket = empty_bucket(target.fn_name.clone(), target.line, target.col, params, metrics);
     let mut ctx = FnContext {
         index: env.index,
         src: env.src,
@@ -2018,7 +2820,17 @@ fn observe(path: PathBuf) -> Result<RayOutput, String> {
     let file_str = canon.to_string_lossy().replace('\\', "/");
     let raw = fs::read_to_string(&canon).map_err(|e| format!("failed to read {file_str}: {e}"))?;
     let parsed = syn::parse_file(&raw).map_err(|e| format!("failed to parse {file_str}: {e}"))?;
+    let comments = scan_rust_comments(&raw);
     let src = SourceText::new(raw);
+
+    let mut collector = StructuralCollector {
+        src: &src,
+        declarations: Vec::new(),
+        imports: Vec::new(),
+        hazards: Vec::new(),
+        syntax_kinds: Vec::new(),
+    };
+    collector.visit_file(&parsed);
 
     let mut index = ModuleIndex::new();
     let mut mod_prefix = Vec::new();
@@ -2031,6 +2843,11 @@ fn observe(path: PathBuf) -> Result<RayOutput, String> {
         file: file_str,
         language: "rust",
         functions,
+        declarations: collector.declarations,
+        comments,
+        imports: collector.imports,
+        hazards: collector.hazards,
+        syntax_kinds: collector.syntax_kinds,
     })
 }
 

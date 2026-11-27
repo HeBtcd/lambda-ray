@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { observe as observeTs } from './observe.js';
+import { evaluateGate, formatGateViolations, loadPolicy } from './gate.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -101,6 +102,11 @@ export function ray(file, root = process.cwd()) {
     file: normalizeFilePath(abs, root),
     language: result.language,
     functions: result.functions,
+    ...(result.declarations !== undefined ? { declarations: result.declarations } : {}),
+    ...(result.comments !== undefined ? { comments: result.comments } : {}),
+    ...(result.imports !== undefined ? { imports: result.imports } : {}),
+    ...(result.hazards !== undefined ? { hazards: result.hazards } : {}),
+    ...(result.syntaxKinds !== undefined ? { syntaxKinds: result.syntaxKinds } : {}),
   };
 }
 
@@ -159,25 +165,109 @@ export function formatRay(data) {
   return lines.join('\n');
 }
 
-if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]))) {
-  const args = process.argv.slice(2);
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log(`usage: lambda-ray <file> [--json]
+export function gate(files, policySpec, root = process.cwd()) {
+  const { name, policy } = loadPolicy(policySpec, root);
+  const fileList = Array.isArray(files) ? files : [files];
+  if (fileList.length === 0) {
+    throw new Error('gate requires at least one file');
+  }
+  const normalizedFiles = [];
+  const violations = [];
+  for (const f of fileList) {
+    const data = ray(f, root);
+    normalizedFiles.push(data.file);
+    violations.push(...evaluateGate(data, policy));
+  }
+  return {
+    passed: violations.length === 0,
+    profile: name,
+    files: normalizedFiles,
+    violations,
+  };
+}
+
+function parseCliArgs(args) {
+  let help = false;
+  let json = false;
+  let hasGate = false;
+  let gateSpec = null;
+  let gateError = null;
+  const positional = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a === '--help' || a === '-h') {
+      help = true;
+    } else if (a === '--json') {
+      json = true;
+    } else if (a === '--gate') {
+      hasGate = true;
+      const next = args[i + 1];
+      if (!next || next.startsWith('-')) {
+        gateError = 'missing value for --gate <profile|policy.json>';
+      } else {
+        gateSpec = next;
+        i += 1;
+      }
+    } else if (a.startsWith('--gate=')) {
+      hasGate = true;
+      gateSpec = a.slice('--gate='.length);
+      if (!gateSpec) gateError = 'missing value for --gate <profile|policy.json>';
+    } else if (!a.startsWith('-')) {
+      positional.push(a);
+    }
+  }
+  return { help, json, hasGate, gateSpec, gateError, positional };
+}
+
+if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]))) {
+  const parsed = parseCliArgs(process.argv.slice(2));
+  if (parsed.help) {
+    if (parsed.hasGate) {
+      console.log(`usage: lambda-ray --gate <profile|policy.json> [--json] <files...>
+profiles:
+  strict-sim            denylist + metrics + comments + forbidden imports
+  strict-sim-allowlist  strict-sim + 4-language AST syntaxKinds & allowedExternalCalls allowlist`);
+    } else {
+      console.log(`usage: lambda-ray <file> [--json]
 languages:
   ts/js   .ts .tsx .mts .cts .js .mjs .cjs .jsx
   cpp     .cpp .cc .cxx .hpp .hh .h .hxx
   csharp  .cs
   rust    .rs`);
+    }
     process.exit(0);
   }
-  const [file] = args.filter((a) => !a.startsWith('-'));
+  if (parsed.hasGate) {
+    if (parsed.gateError) {
+      console.error(`lambda-ray: ${parsed.gateError}`);
+      process.exit(2);
+    }
+    if (parsed.positional.length === 0) {
+      console.error('usage: lambda-ray --gate <profile|policy.json> [--json] <files...>');
+      process.exit(2);
+    }
+    try {
+      const report = gate(parsed.positional, parsed.gateSpec, process.cwd());
+      if (parsed.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatGateViolations(report.violations, report.files));
+      }
+      process.exit(report.passed ? 0 : 1);
+    } catch (err) {
+      console.error(`lambda-ray: ${err.message}`);
+      process.exit(2);
+    }
+  }
+  const [file] = parsed.positional;
   if (!file) {
     console.error('usage: lambda-ray <file> [--json]');
     process.exit(2);
   }
   try {
     const data = ray(file, process.cwd());
-    console.log(args.includes('--json') ? JSON.stringify(data, null, 2) : formatRay(data));
+    console.log(parsed.json ? JSON.stringify(data, null, 2) : formatRay(data));
     process.exit(0);
   } catch (err) {
     console.error(`lambda-ray: ${err.message}`);

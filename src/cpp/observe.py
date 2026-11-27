@@ -233,6 +233,107 @@ def observe(path):
     class_fields = {}
     fn_defs = []
     fn_by_name = {}
+    declarations = []
+    comment_spans = []
+    imports = []
+    hazards = []
+    syntax_kinds = []
+
+    BLACKBOARD_NAMES = {
+        "Blackboard", "GameplayTag", "GameplayTagContainer",
+        "FGameplayTag", "FGameplayTagContainer", "UAbilitySystemComponent", "UAttributeSet",
+    }
+
+    def scan_syntax_extras(node):
+        t = node.type
+        if t == "comment":
+            text = txt(node)
+            comment_spans.append({
+                "kind": "block" if text.startswith("/*") else "line",
+                "line": node.start_point[0] + 1,
+                "endLine": node.end_point[0] + 1,
+                "col": node.start_point[1] + 1,
+            })
+            return
+        if t in ("storage_class_specifier", "type_qualifier", "virtual_specifier"):
+            syntax_kinds.append({"kind": f"{t}:{txt(node).strip()}", **loc(node)})
+        elif t == "virtual":
+            syntax_kinds.append({"kind": "virtual", **loc(node)})
+        elif t == "template_function" and txt(node.child_by_field_name("name")) in CAST_OPS:
+            syntax_kinds.append({"kind": f"cast:{txt(node.child_by_field_name('name'))}", **loc(node)})
+        elif node.is_named:
+            syntax_kinds.append({"kind": t, **loc(node)})
+        if t == "preproc_include":
+            path_node = node.child_by_field_name("path") or next(
+                (c for c in node.children if c.type in ("system_lib_string", "string_literal")),
+                None,
+            )
+            if path_node is not None:
+                raw = txt(path_node)
+                src = raw.strip('"') if path_node.type == "string_literal" else raw
+                imports.append({"source": src, "kind": "include", **loc(node)})
+            return
+        if t == "goto_statement":
+            hazards.append({"kind": "unsafe", "detail": "goto", **loc(node)})
+        elif t == "template_function":
+            fname = txt(node.child_by_field_name("name"))
+            if fname in ("reinterpret_cast", "const_cast"):
+                hazards.append({"kind": "unsafe", "detail": fname, **loc(node)})
+            elif fname in ("dynamic_cast", "std::any_cast", "any_cast"):
+                hazards.append({"kind": "reflection", "detail": fname, **loc(node)})
+        elif t == "call_expression":
+            fn_node = node.child_by_field_name("function")
+            if fn_node is not None and txt(fn_node) == "typeid":
+                hazards.append({"kind": "reflection", "detail": "typeid", **loc(node)})
+        elif t in ("typeid_expression",):
+            hazards.append({"kind": "reflection", "detail": "typeid", **loc(node)})
+        elif t == "template_type":
+            raw_t = txt(node)
+            tname = txt(node.child_by_field_name("name"))
+            if ("unordered_map" in tname or tname.endswith("map")) and "std::any" in raw_t:
+                hazards.append({"kind": "blackboard", "detail": raw_t, **loc(node)})
+            elif tname == "TMap" and ("FName" in raw_t or "GameplayTag" in raw_t):
+                hazards.append({"kind": "blackboard", "detail": raw_t, **loc(node)})
+        elif t in ("type_identifier", "qualified_identifier"):
+            q = txt(node)
+            base_q = q.split("::")[-1]
+            if q == "std::any":
+                hazards.append({"kind": "reflection", "detail": "std::any", **loc(node)})
+            elif base_q in BLACKBOARD_NAMES and node.parent is not None and node.parent.type not in ("base_class_clause",):
+                hazards.append({"kind": "blackboard", "detail": q, **loc(node)})
+        for c in node.children:
+            scan_syntax_extras(c)
+
+    scan_syntax_extras(tree.root_node)
+
+    def extract_bases(type_node):
+        bases = []
+        bc = next((c for c in type_node.children if c.type == "base_class_clause"), None)
+        if bc is None:
+            return bases
+        for c in bc.children:
+            if c.type in ("type_identifier", "qualified_identifier", "template_type"):
+                bases.append(txt(c))
+        return bases
+
+    def fn_poly_modifiers(node):
+        mods = []
+        has_eq_zero = False
+        saw_eq = False
+        for c in node.children:
+            if c.type == "virtual":
+                mods.append("virtual")
+            elif c.type == "virtual_specifier":
+                vtxt = txt(c).strip()
+                if vtxt in ("override", "final") and vtxt not in mods:
+                    mods.append(vtxt)
+            elif txt(c) == "=":
+                saw_eq = True
+            elif saw_eq and c.type == "number_literal" and txt(c) == "0":
+                has_eq_zero = True
+        if has_eq_zero:
+            mods.append("abstract")
+        return mods
 
     def collect_top(node, ns_prefix, class_prefix):
         t = node.type
@@ -247,12 +348,37 @@ def observe(path):
         if t in ("class_specifier", "struct_specifier"):
             cname = node.child_by_field_name("name")
             body = node.child_by_field_name("body")
-            if cname is not None and body is not None:
+            bases = extract_bases(node)
+            if cname is not None and (body is not None or bases):
                 cqual = f"{class_prefix}::{txt(cname)}" if class_prefix else ("::".join([*ns_prefix, txt(cname)]) if ns_prefix else txt(cname))
+                kind = "class" if t == "class_specifier" else "struct"
+                mods = [txt(c).strip() for c in node.children if c.type == "virtual_specifier"]
+                declarations.append({
+                    "kind": kind,
+                    "name": cqual,
+                    "bases": bases,
+                    "modifiers": mods,
+                    **loc(node),
+                })
                 class_fields.setdefault(cqual, {})
-                for c in body.children:
-                    collect_top(c, ns_prefix, cqual)
+                if body is not None:
+                    for c in body.children:
+                        collect_top(c, ns_prefix, cqual)
                 return
+        if t == "enum_specifier":
+            ename = node.child_by_field_name("name")
+            body = node.child_by_field_name("body")
+            if ename is not None and body is not None:
+                equal = f"{class_prefix}::{txt(ename)}" if class_prefix else ("::".join([*ns_prefix, txt(ename)]) if ns_prefix else txt(ename))
+                is_scoped = any(c.type in ("class", "struct") for c in node.children)
+                declarations.append({
+                    "kind": "enum",
+                    "name": equal,
+                    "bases": [],
+                    "modifiers": ["class"] if is_scoped else [],
+                    **loc(node),
+                })
+            return
         if t == "template_declaration":
             for c in node.children:
                 if c.is_named and c.type != "template_parameter_list":
@@ -261,20 +387,40 @@ def observe(path):
         if t == "field_declaration" and class_prefix:
             nested_handled = False
             for c in node.children:
-                if c.type in ("class_specifier", "struct_specifier"):
+                if c.type in ("class_specifier", "struct_specifier", "enum_specifier"):
                     collect_top(c, ns_prefix, class_prefix)
                     nested_handled = True
             if nested_handled:
                 return
             decl_kind, quals = decl_qualifiers(node)
             scope = "module" if "static" in quals else "member"
+            poly_mods = fn_poly_modifiers(node)
             for d in node.children_by_field_name("declarator"):
                 fn_d = find_fn_declarator(d)
                 if d.type == "function_declarator" or (fn_d is not None and fn_d.type == "function_declarator"):
+                    if poly_mods:
+                        fid = first_id(fn_d or d)
+                        mname = f"{class_prefix}::{txt(fid)}" if fid is not None else class_prefix
+                        declarations.append({
+                            "kind": "method",
+                            "name": mname,
+                            "bases": [],
+                            "modifiers": poly_mods,
+                            **loc(node),
+                        })
                     continue
                 fid = first_id(d)
                 if fid is not None:
-                    class_fields[class_prefix][txt(fid)] = (scope, decl_kind)
+                    fname = txt(fid)
+                    class_fields[class_prefix][fname] = (scope, decl_kind)
+                    if "static" in quals:
+                        declarations.append({
+                            "kind": "field",
+                            "name": f"{class_prefix}::{fname}",
+                            "bases": [],
+                            "modifiers": ["static", decl_kind],
+                            **loc(node),
+                        })
             return
         if t == "declaration" and not class_prefix:
             decl_kind, _ = decl_qualifiers(node)
@@ -288,10 +434,26 @@ def observe(path):
                     qual = "::".join([*ns_prefix, name]) if ns_prefix else name
                     module_vars[name] = decl_kind
                     module_vars[qual] = decl_kind
+                    declarations.append({
+                        "kind": "variable",
+                        "name": qual,
+                        "bases": [],
+                        "modifiers": ["module", decl_kind],
+                        **loc(node),
+                    })
             return
         if t == "function_definition":
             qual, owner = fn_name_parts(node, ns_prefix, class_prefix)
             if qual:
+                poly_mods = fn_poly_modifiers(node)
+                if poly_mods:
+                    declarations.append({
+                        "kind": "method",
+                        "name": qual,
+                        "bases": [],
+                        "modifiers": poly_mods,
+                        **loc(node),
+                    })
                 fn_defs.append((qual, owner, node))
                 fn_by_name[qual] = qual
                 short_name = qual.split("::")[-1]
@@ -304,11 +466,48 @@ def observe(path):
 
     collect_top(tree.root_node, [], None)
 
-    def empty_bucket(name, node, params):
+    def compute_metrics(fn_node, body_node):
+        lines = fn_node.end_point[0] - fn_node.start_point[0] + 1
+        branches = 0
+        max_nesting = 0
+        NEST_TYPES = {
+            "if_statement", "switch_statement", "for_statement",
+            "for_range_loop", "while_statement", "do_statement", "try_statement",
+        }
+        BRANCH_TYPES = {
+            "if_statement", "case_statement", "catch_clause", "conditional_expression",
+            "for_statement", "for_range_loop", "while_statement", "do_statement",
+        }
+
+        def walk_m(n, depth):
+            nonlocal branches, max_nesting
+            if n is None or n.type in ("lambda_expression", "function_definition"):
+                return
+            next_depth = depth
+            is_else_if = (
+                n.type == "if_statement"
+                and n.parent is not None
+                and n.parent.type == "else_clause"
+            )
+            if n.type in NEST_TYPES and not is_else_if:
+                next_depth = depth + 1
+                if next_depth > max_nesting:
+                    max_nesting = next_depth
+            if n.type in BRANCH_TYPES:
+                branches += 1
+            for c in n.children:
+                walk_m(c, next_depth)
+
+        if body_node is not None:
+            walk_m(body_node, 0)
+        return {"lines": lines, "branches": branches, "maxNesting": max_nesting}
+
+    def empty_bucket(name, node, params, body_node):
         return {
             "name": name,
             **loc(node),
             "params": params,
+            "metrics": compute_metrics(node, body_node),
             "reads": [],
             "writes": [],
             "calls": [],
@@ -354,7 +553,16 @@ def observe(path):
             for d in node.children_by_field_name("declarator"):
                 fid = first_id(d)
                 if fid is not None:
-                    local_map.setdefault(txt(fid), (scope, kind))
+                    vname = txt(fid)
+                    local_map.setdefault(vname, (scope, kind))
+                    if is_static:
+                        declarations.append({
+                            "kind": "variable",
+                            "name": vname,
+                            "bases": [],
+                            "modifiers": ["static", decl_kind],
+                            **loc(node),
+                        })
         elif node.type == "for_range_loop":
             d = node.child_by_field_name("declarator")
             fid = first_id(d)
@@ -374,7 +582,7 @@ def observe(path):
     functions_out = []
 
     def walk_body(fn_name, owner_class, fn_node, body_node, scopes):
-        bucket = empty_bucket(fn_name, fn_node, fn_params(fn_node))
+        bucket = empty_bucket(fn_name, fn_node, fn_params(fn_node), body_node)
         functions_out.append(bucket)
 
         def record_write(target, node_loc, is_compound=False):
@@ -626,7 +834,16 @@ def observe(path):
         scan_locals(body, local_scope)
         walk_body(qual, owner_class, fn_node, body, (local_scope,))
 
-    return {"file": file_str, "language": "cpp", "functions": functions_out}
+    return {
+        "file": file_str,
+        "language": "cpp",
+        "functions": functions_out,
+        "declarations": declarations,
+        "comments": {"count": len(comment_spans), "spans": comment_spans},
+        "imports": imports,
+        "hazards": hazards,
+        "syntaxKinds": syntax_kinds,
+    }
 
 
 if __name__ == "__main__":

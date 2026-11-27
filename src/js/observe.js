@@ -212,12 +212,300 @@ export function observe(entryFile, root = process.cwd()) {
 
   const file = relative(root, entryFile).split(sep).join('/');
   const functions = [];
+  const declarations = [];
+  const imports = [];
+  const hazards = [];
+  const syntaxKinds = [];
 
-  const emptyBucket = (name, line, col, params) => ({
+  const scanSyntaxKinds = (node) => {
+    const { line, col } = locOf(sf, node);
+    if (FN_LIKE.has(node.kind) && node.asteriskToken) {
+      syntaxKinds.push({ kind: 'GeneratorFunction', line, col });
+    }
+    if (ts.isVariableDeclarationList(node)) {
+      const flags = ts.getCombinedNodeFlags(node);
+      if (!(flags & (ts.NodeFlags.Const | ts.NodeFlags.Let))) {
+        syntaxKinds.push({ kind: 'VarKeyword', line, col });
+      }
+    }
+    const kname = ts.SyntaxKind[node.kind];
+    if (kname) syntaxKinds.push({ kind: kname, line, col });
+    ts.forEachChild(node, scanSyntaxKinds);
+  };
+  scanSyntaxKinds(sf);
+
+  const commentMap = new Map();
+  const addCommentRanges = (ranges) => {
+    if (!ranges) return;
+    for (const r of ranges) {
+      if (commentMap.has(r.pos)) continue;
+      const start = sf.getLineAndCharacterOfPosition(r.pos);
+      const end = sf.getLineAndCharacterOfPosition(r.end);
+      commentMap.set(r.pos, {
+        kind: r.kind === K.SingleLineCommentTrivia ? 'line' : 'block',
+        line: start.line + 1,
+        endLine: end.line + 1,
+        col: start.character + 1,
+      });
+    }
+  };
+  const scanComments = (node) => {
+    addCommentRanges(ts.getLeadingCommentRanges(sf.text, node.pos));
+    addCommentRanges(ts.getTrailingCommentRanges(sf.text, node.end));
+    for (const child of node.getChildren(sf)) {
+      scanComments(child);
+    }
+  };
+  scanComments(sf);
+  const commentSpans = [...commentMap.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, v]) => v);
+  const comments = { count: commentSpans.length, spans: commentSpans };
+
+  const spanLines = (node) => {
+    const s = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line;
+    const e = sf.getLineAndCharacterOfPosition(node.getEnd()).line;
+    return e - s + 1;
+  };
+
+  const computeBodyMetrics = (bodyNode) => {
+    let branches = 0;
+    let maxNesting = 0;
+    const walk = (n, depth) => {
+      if (!n || FN_LIKE.has(n.kind)) return;
+      let nextDepth = depth;
+      const isElseIf =
+        ts.isIfStatement(n) &&
+        n.parent &&
+        ts.isIfStatement(n.parent) &&
+        n.parent.elseStatement === n;
+      if (
+        ts.isIfStatement(n) ||
+        ts.isForStatement(n) ||
+        ts.isForInStatement(n) ||
+        ts.isForOfStatement(n) ||
+        ts.isWhileStatement(n) ||
+        ts.isDoStatement(n) ||
+        ts.isSwitchStatement(n) ||
+        ts.isTryStatement(n)
+      ) {
+        if (!isElseIf) {
+          nextDepth = depth + 1;
+          if (nextDepth > maxNesting) maxNesting = nextDepth;
+        }
+      }
+      if (
+        ts.isIfStatement(n) ||
+        ts.isCaseClause(n) ||
+        ts.isCatchClause(n) ||
+        ts.isConditionalExpression(n) ||
+        ts.isForStatement(n) ||
+        ts.isForInStatement(n) ||
+        ts.isForOfStatement(n) ||
+        ts.isWhileStatement(n) ||
+        ts.isDoStatement(n)
+      ) {
+        branches += 1;
+      }
+      ts.forEachChild(n, (c) => walk(c, nextDepth));
+    };
+    if (bodyNode) walk(bodyNode, 0);
+    return { branches, maxNesting };
+  };
+
+  const modifierNames = (node) =>
+    (ts.canHaveModifiers(node) ? ts.getModifiers(node) : node.modifiers)
+      ?.map((m) => ts.tokenToString(m.kind))
+      .filter(Boolean) ?? [];
+
+  const heritageBases = (node) => {
+    const out = [];
+    for (const clause of node.heritageClauses ?? []) {
+      for (const t of clause.types ?? []) {
+        out.push(t.expression.getText(sf));
+      }
+    }
+    return out;
+  };
+
+  const collectBindingNames = (nameNode, out = []) => {
+    if (ts.isIdentifier(nameNode)) {
+      out.push(nameNode.text);
+    } else if (ts.isObjectBindingPattern(nameNode) || ts.isArrayBindingPattern(nameNode)) {
+      for (const el of nameNode.elements) {
+        if (ts.isBindingElement(el)) collectBindingNames(el.name, out);
+      }
+    }
+    return out;
+  };
+
+  const BLACKBOARD_TYPE_RE = /^(Map|WeakMap|Blackboard|GameplayTag|GameplayTagContainer|FGameplayTagContainer|UAbilitySystemComponent|UAttributeSet|AttributeSet)$/i;
+  const REFLECTION_PROPS = new Set([
+    'defineProperty',
+    'defineProperties',
+    'setPrototypeOf',
+    'getOwnPropertyDescriptor',
+    'getOwnPropertyDescriptors',
+  ]);
+
+  const scanStructural = (node, inFn) => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      imports.push({
+        source: node.moduleSpecifier.text,
+        kind: 'import',
+        ...(node.importClause?.isTypeOnly ? { typeOnly: true } : {}),
+        ...locOf(sf, node),
+      });
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      imports.push({
+        source: node.moduleSpecifier.text,
+        kind: 'export-from',
+        ...(node.isTypeOnly ? { typeOnly: true } : {}),
+        ...locOf(sf, node),
+      });
+    } else if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      const clsName = node.name?.text ??
+        (ts.isVariableDeclaration(node.parent) && node.parent.initializer === node ? node.parent.name.getText(sf) : '<class>');
+      const mods = modifierNames(node).filter((m) => m === 'abstract' || m === 'declare');
+      declarations.push({
+        kind: 'class',
+        name: clsName,
+        bases: heritageBases(node),
+        modifiers: mods,
+        ...locOf(sf, node),
+      });
+      for (const m of node.members ?? []) {
+        const mMods = modifierNames(m);
+        if (ts.isPropertyDeclaration(m)) {
+          const propName = `${clsName}.${m.name.getText(sf)}`;
+          if (mMods.includes('static') && !mMods.includes('readonly')) {
+            declarations.push({
+              kind: 'field',
+              name: propName,
+              bases: [],
+              modifiers: ['static', 'mutable'],
+              ...locOf(sf, m),
+            });
+          } else if (mMods.includes('abstract') || mMods.includes('override')) {
+            declarations.push({
+              kind: 'property',
+              name: propName,
+              bases: [],
+              modifiers: mMods.filter((x) => x === 'abstract' || x === 'override'),
+              ...locOf(sf, m),
+            });
+          }
+        } else if (ts.isMethodDeclaration(m) || ts.isGetAccessor(m) || ts.isSetAccessor(m)) {
+          const sigMods = mMods.filter((x) => x === 'abstract' || x === 'override');
+          if (sigMods.length) {
+            declarations.push({
+              kind: 'method',
+              name: `${clsName}.${m.name.getText(sf)}`,
+              bases: [],
+              modifiers: sigMods,
+              ...locOf(sf, m),
+            });
+          }
+        }
+      }
+    } else if (ts.isInterfaceDeclaration(node)) {
+      declarations.push({
+        kind: 'interface',
+        name: node.name.text,
+        bases: heritageBases(node),
+        modifiers: [],
+        ...locOf(sf, node),
+      });
+    } else if (ts.isEnumDeclaration(node)) {
+      const mods = modifierNames(node).filter((m) => m === 'const');
+      declarations.push({
+        kind: 'enum',
+        name: node.name.text,
+        bases: [],
+        modifiers: mods,
+        ...locOf(sf, node),
+      });
+    } else if (!inFn && ts.isVariableStatement(node)) {
+      const flags = ts.getCombinedNodeFlags(node.declarationList);
+      const isConst = Boolean(flags & ts.NodeFlags.Const);
+      for (const decl of node.declarationList.declarations) {
+        if (decl.initializer && FN_LIKE.has(decl.initializer.kind)) continue;
+        for (const vname of collectBindingNames(decl.name)) {
+          declarations.push({
+            kind: 'variable',
+            name: vname,
+            bases: [],
+            modifiers: ['module', isConst ? 'const' : 'mutable'],
+            ...locOf(sf, decl),
+          });
+        }
+      }
+    } else if (ts.isWithStatement(node)) {
+      hazards.push({ kind: 'eval', detail: 'with', ...locOf(sf, node) });
+    } else if (ts.isDeleteExpression(node)) {
+      hazards.push({ kind: 'blackboard', detail: `delete ${node.expression.getText(sf)}`, ...locOf(sf, node) });
+    } else if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const expr = unwrapExpr(node.expression);
+      if (ts.isCallExpression(node) && expr.kind === K.ImportKeyword) {
+        const arg0 = node.arguments?.[0];
+        imports.push({
+          source: arg0 && ts.isStringLiteral(arg0) ? arg0.text : '<dynamic>',
+          kind: 'dynamic-import',
+          ...locOf(sf, node),
+        });
+      } else if (ts.isCallExpression(node) && ts.isIdentifier(expr) && expr.text === 'require') {
+        const arg0 = node.arguments?.[0];
+        if (arg0 && ts.isStringLiteral(arg0)) {
+          imports.push({ source: arg0.text, kind: 'require', ...locOf(sf, node) });
+        }
+      }
+      if (ts.isIdentifier(expr)) {
+        if (expr.text === 'eval' || expr.text === 'Function') {
+          hazards.push({ kind: 'eval', detail: expr.text, ...locOf(sf, node) });
+        } else if (expr.text === 'Proxy') {
+          hazards.push({ kind: 'reflection', detail: 'Proxy', ...locOf(sf, node) });
+        } else if (BLACKBOARD_TYPE_RE.test(expr.text)) {
+          hazards.push({ kind: 'blackboard', detail: expr.text, ...locOf(sf, node) });
+        }
+      } else if (ts.isPropertyAccessExpression(expr)) {
+        const objText = unwrapExpr(expr.expression).getText(sf);
+        const propText = expr.name.text;
+        if (objText === 'Reflect') {
+          hazards.push({ kind: 'reflection', detail: `Reflect.${propText}`, ...locOf(sf, node) });
+        } else if (objText === 'Object' && REFLECTION_PROPS.has(propText)) {
+          hazards.push({ kind: 'reflection', detail: `Object.${propText}`, ...locOf(sf, node) });
+        } else if ((objText === 'globalThis' || objText === 'window') && propText === 'eval') {
+          hazards.push({ kind: 'eval', detail: `${objText}.eval`, ...locOf(sf, node) });
+        }
+      }
+    } else if (ts.isTypeReferenceNode(node)) {
+      const tName = node.typeName.getText(sf);
+      if (tName === 'Record' && node.typeArguments?.length === 2 && node.typeArguments[1].kind === K.AnyKeyword) {
+        hazards.push({ kind: 'blackboard', detail: node.getText(sf), ...locOf(sf, node) });
+      } else if (BLACKBOARD_TYPE_RE.test(tName)) {
+        const isParamOrInterface = (() => {
+          for (let p = node.parent; p; p = p.parent) {
+            if (ts.isInterfaceDeclaration(p) || ts.isTypeAliasDeclaration(p)) return true;
+          }
+          return false;
+        })();
+        if (!isParamOrInterface || tName !== 'Map') {
+          hazards.push({ kind: 'blackboard', detail: tName, ...locOf(sf, node) });
+        }
+      }
+    }
+
+    const nextInFn = inFn || FN_LIKE.has(node.kind);
+    ts.forEachChild(node, (c) => scanStructural(c, nextInFn));
+  };
+  ts.forEachChild(sf, (c) => scanStructural(c, false));
+
+  const emptyBucket = (name, line, col, params, metrics) => ({
     name,
     line,
     col,
     params,
+    metrics,
     reads: [],
     writes: [],
     calls: [],
@@ -228,7 +516,7 @@ export function observe(entryFile, root = process.cwd()) {
     suspends: [],
   });
 
-  const moduleBucket = emptyBucket('<module>', 1, 1, []);
+  const moduleBucket = emptyBucket('<module>', 1, 1, [], { lines: 0, branches: 0, maxNesting: 0 });
   const fnNameMap = new Map();
 
   function symInfo(id, curFn) {
@@ -524,7 +812,13 @@ export function observe(entryFile, root = process.cwd()) {
       fnNameMap.set(node.parent, name);
     }
     const { line, col } = locOf(sf, node);
-    const bucket = emptyBucket(name, line, col, paramNames(node, sf));
+    const bodyMetrics = computeBodyMetrics(node.body);
+    const metrics = {
+      lines: spanLines(node),
+      branches: bodyMetrics.branches,
+      maxNesting: bodyMetrics.maxNesting,
+    };
+    const bucket = emptyBucket(name, line, col, paramNames(node, sf), metrics);
     functions.push({ node, bucket });
     return name;
   }
@@ -638,6 +932,23 @@ export function observe(entryFile, root = process.cwd()) {
 
   ts.forEachChild(sf, (c) => visitNode(c, null, moduleBucket));
 
+  let modLines = 0;
+  let modBranches = 0;
+  let modMaxNesting = 0;
+  for (const stmt of sf.statements) {
+    if (isPureDeclarationOnly(stmt) || ts.isFunctionDeclaration(stmt) || ts.isClassDeclaration(stmt) || ts.isEnumDeclaration(stmt)) {
+      continue;
+    }
+    if (ts.isVariableStatement(stmt) && stmt.declarationList.declarations.every((d) => !d.initializer || FN_LIKE.has(d.initializer.kind))) {
+      continue;
+    }
+    modLines += spanLines(stmt);
+    const m = computeBodyMetrics(stmt);
+    modBranches += m.branches;
+    if (m.maxNesting > modMaxNesting) modMaxNesting = m.maxNesting;
+  }
+  moduleBucket.metrics = { lines: modLines, branches: modBranches, maxNesting: modMaxNesting };
+
   const hasFacts = (b) =>
     b.reads.length || b.writes.length || b.calls.length || b.subscripts.length ||
     b.throws.length || b.catches.length || b.loops.length || b.suspends.length;
@@ -646,5 +957,5 @@ export function observe(entryFile, root = process.cwd()) {
   if (hasFacts(moduleBucket)) out.push(moduleBucket);
   for (const { bucket } of functions) out.push(bucket);
 
-  return { file, language: 'ts', functions: out };
+  return { file, language: 'ts', functions: out, declarations, comments, imports, hazards, syntaxKinds };
 }

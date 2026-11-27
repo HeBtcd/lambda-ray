@@ -66,6 +66,45 @@ static (int line, int col) LocOf(SyntaxNode n)
     return (p.Line + 1, p.Character + 1);
 }
 
+static (int line, int endLine, int col) SpanOf(SyntaxNode n)
+{
+    var span = n.GetLocation().GetLineSpan();
+    return (span.StartLinePosition.Line + 1, span.EndLinePosition.Line + 1, span.StartLinePosition.Character + 1);
+}
+
+static (int line, int endLine, int col) TriviaSpanOf(SyntaxTrivia t)
+{
+    var span = t.GetLocation().GetLineSpan();
+    return (span.StartLinePosition.Line + 1, span.EndLinePosition.Line + 1, span.StartLinePosition.Character + 1);
+}
+
+static FnMetrics ComputeBodyMetrics(SyntaxNode? body, int lines)
+{
+    var branches = 0;
+    var maxNesting = 0;
+    void Walk(SyntaxNode n, int depth)
+    {
+        if (n is LocalFunctionStatementSyntax or AnonymousFunctionExpressionSyntax) return;
+        var nextDepth = depth;
+        var isElseIf = n is IfStatementSyntax ifs && ifs.Parent is ElseClauseSyntax;
+        if (n is IfStatementSyntax or SwitchStatementSyntax or ForStatementSyntax or ForEachStatementSyntax or ForEachVariableStatementSyntax or WhileStatementSyntax or DoStatementSyntax or TryStatementSyntax)
+        {
+            if (!isElseIf)
+            {
+                nextDepth = depth + 1;
+                if (nextDepth > maxNesting) maxNesting = nextDepth;
+            }
+        }
+        if (n is IfStatementSyntax or SwitchSectionSyntax or SwitchExpressionArmSyntax or CatchClauseSyntax or ConditionalExpressionSyntax or ForStatementSyntax or ForEachStatementSyntax or ForEachVariableStatementSyntax or WhileStatementSyntax or DoStatementSyntax)
+        {
+            branches++;
+        }
+        foreach (var c in n.ChildNodes()) Walk(c, nextDepth);
+    }
+    if (body != null) Walk(body, 0);
+    return new FnMetrics(lines, branches, maxNesting);
+}
+
 static string EnclosingTypePrefix(SyntaxNode node)
 {
     var parts = new Stack<string>();
@@ -395,9 +434,10 @@ void WalkInto(SyntaxNode body, string fnName, IMethodSymbol? cur, FunctionBucket
         {
             var lName = $"{fnName}/{lf.Identifier.Text}";
             var lSym = model.GetDeclaredSymbol(lf) as IMethodSymbol;
-            var lBucket = NewBucket(lName, lf, ParamNames(lf));
-            fnBuckets.Add(lBucket);
             var lBody = (SyntaxNode?)lf.Body ?? lf.ExpressionBody;
+            var (ls, le, _) = SpanOf(lf);
+            var lBucket = NewBucket(lName, lf, ParamNames(lf), ComputeBodyMetrics(lBody, le - ls + 1));
+            fnBuckets.Add(lBucket);
             if (lBody != null) WalkInto(lBody, lName, lSym, lBucket);
             return;
         }
@@ -406,7 +446,8 @@ void WalkInto(SyntaxNode body, string fnName, IMethodSymbol? cur, FunctionBucket
             var (al, ac) = LocOf(af);
             var aName = $"{fnName}/<fn>@{al}:{ac}";
             var aSym = model.GetSymbolInfo(af).Symbol as IMethodSymbol;
-            var aBucket = NewBucket(aName, af, ParamNames(af));
+            var (asLine, aeLine, _) = SpanOf(af);
+            var aBucket = NewBucket(aName, af, ParamNames(af), ComputeBodyMetrics(af.Body, aeLine - asLine + 1));
             fnBuckets.Add(aBucket);
             WalkInto(af.Body, aName, aSym, aBucket);
             return;
@@ -639,16 +680,236 @@ void WalkInto(SyntaxNode body, string fnName, IMethodSymbol? cur, FunctionBucket
     Visit(body);
 }
 
-static FunctionBucket NewBucket(string name, SyntaxNode node, string[] parms)
+static FunctionBucket NewBucket(string name, SyntaxNode node, string[] parms, FnMetrics metrics)
 {
     var (line, col) = LocOf(node);
-    return new FunctionBucket(name, line, col, parms);
+    return new FunctionBucket(name, line, col, parms, metrics);
+}
+
+var commentSpans = root.DescendantTrivia(descendIntoTrivia: true)
+    .Where(t => t.Kind() is SyntaxKind.SingleLineCommentTrivia
+        or SyntaxKind.MultiLineCommentTrivia
+        or SyntaxKind.SingleLineDocumentationCommentTrivia
+        or SyntaxKind.MultiLineDocumentationCommentTrivia)
+    .Select(t =>
+    {
+        var (line, endLine, col) = TriviaSpanOf(t);
+        var kind = t.Kind() is SyntaxKind.MultiLineCommentTrivia or SyntaxKind.MultiLineDocumentationCommentTrivia ? "block" : "line";
+        return new CommentSpan(kind, line, endLine, col);
+    })
+    .ToList();
+var commentsInfo = new CommentsInfo(commentSpans.Count, commentSpans);
+
+var importsList = root.DescendantNodes()
+    .OfType<UsingDirectiveSyntax>()
+    .Select(u =>
+    {
+        var (line, col) = LocOf(u);
+        var kind = u.StaticKeyword.IsKind(SyntaxKind.StaticKeyword) ? "using-static" : "using";
+        var src = u.Name?.ToString() ?? u.Alias?.ToString() ?? "";
+        return new ImportFact(src, kind, line, col);
+    })
+    .ToList();
+
+var declarationsList = new List<DeclarationFact>();
+foreach (var td in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+{
+    var kind = td switch
+    {
+        RecordDeclarationSyntax r => r.ClassOrStructKeyword.IsKind(SyntaxKind.StructKeyword) ? "struct" : "record",
+        StructDeclarationSyntax => "struct",
+        InterfaceDeclarationSyntax => "interface",
+        EnumDeclarationSyntax => "enum",
+        _ => "class",
+    };
+    var bases = td.BaseList?.Types.Select(t => t.Type.ToString()).ToList() ?? new List<string>();
+    var mods = td.Modifiers.Select(m => m.Text).ToList();
+    if (td is RecordDeclarationSyntax rd && rd.ClassOrStructKeyword.IsKind(SyntaxKind.StructKeyword) && !mods.Contains("record"))
+    {
+        mods.Add("record");
+    }
+    var prefix = EnclosingTypePrefix(td);
+    var fullName = string.IsNullOrEmpty(prefix) ? td.Identifier.Text : $"{prefix}.{td.Identifier.Text}";
+    var (line, col) = LocOf(td);
+    declarationsList.Add(new DeclarationFact(kind, fullName, bases, mods, line, col));
+}
+
+foreach (var member in root.DescendantNodes().OfType<MemberDeclarationSyntax>())
+{
+    var mods = member.Modifiers.Select(m => m.Text).ToList();
+    var prefix = EnclosingTypePrefix(member);
+    if (member is FieldDeclarationSyntax f)
+    {
+        if (mods.Contains("static"))
+        {
+            var mutMod = mods.Contains("readonly") || mods.Contains("const") ? "readonly" : "mutable";
+            var (line, col) = LocOf(f);
+            foreach (var v in f.Declaration.Variables)
+            {
+                var fname = string.IsNullOrEmpty(prefix) ? v.Identifier.Text : $"{prefix}.{v.Identifier.Text}";
+                declarationsList.Add(new DeclarationFact("field", fname, new List<string>(), new List<string> { "static", mutMod }, line, col));
+            }
+        }
+        else if (mods.Contains("const"))
+        {
+            var (line, col) = LocOf(f);
+            foreach (var v in f.Declaration.Variables)
+            {
+                var fname = string.IsNullOrEmpty(prefix) ? v.Identifier.Text : $"{prefix}.{v.Identifier.Text}";
+                declarationsList.Add(new DeclarationFact("field", fname, new List<string>(), new List<string> { "const" }, line, col));
+            }
+        }
+        continue;
+    }
+    var polyMods = mods.Where(m => m is "virtual" or "abstract" or "override").ToList();
+    if (member is PropertyDeclarationSyntax prop)
+    {
+        if (mods.Contains("static") && prop.AccessorList != null &&
+            prop.AccessorList.Accessors.Any(a => a.Keyword.IsKind(SyntaxKind.SetKeyword)))
+        {
+            var (line, col) = LocOf(prop);
+            var pname = string.IsNullOrEmpty(prefix) ? prop.Identifier.Text : $"{prefix}.{prop.Identifier.Text}";
+            declarationsList.Add(new DeclarationFact("property", pname, new List<string>(), new List<string> { "static", "mutable" }, line, col));
+        }
+        if (polyMods.Count > 0)
+        {
+            var (line, col) = LocOf(prop);
+            var pname = string.IsNullOrEmpty(prefix) ? prop.Identifier.Text : $"{prefix}.{prop.Identifier.Text}";
+            declarationsList.Add(new DeclarationFact("property", pname, new List<string>(), polyMods, line, col));
+        }
+    }
+    else if (polyMods.Count > 0 && member is MethodDeclarationSyntax m)
+    {
+        var (line, col) = LocOf(m);
+        var mname = string.IsNullOrEmpty(prefix) ? m.Identifier.Text : $"{prefix}.{m.Identifier.Text}";
+        declarationsList.Add(new DeclarationFact("method", mname, new List<string>(), polyMods, line, col));
+    }
+    else if (polyMods.Count > 0 && member is IndexerDeclarationSyntax idx)
+    {
+        var (line, col) = LocOf(idx);
+        var iname = string.IsNullOrEmpty(prefix) ? "indexer" : $"{prefix}.indexer";
+        declarationsList.Add(new DeclarationFact("indexer", iname, new List<string>(), polyMods, line, col));
+    }
+}
+
+var hazardsList = new List<HazardFact>();
+var reflectionCallNames = new HashSet<string>(StringComparer.Ordinal)
+{
+    "GetType", "GetMethod", "GetMethods", "GetProperty", "GetProperties",
+    "GetField", "GetFields", "GetConstructor", "GetConstructors", "InvokeMember",
+    "CreateInstance", "Load", "LoadFrom", "LoadFile",
+};
+var blackboardTypeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    "Hashtable", "ExpandoObject", "DynamicObject", "Blackboard",
+    "GameplayTag", "GameplayTagContainer", "AbilitySystemComponent", "AttributeSet",
+};
+foreach (var node in root.DescendantNodes())
+{
+    if (node is UnsafeStatementSyntax or FixedStatementSyntax or StackAllocArrayCreationExpressionSyntax or ImplicitStackAllocArrayCreationExpressionSyntax or PointerTypeSyntax)
+    {
+        var (line, col) = LocOf(node);
+        hazardsList.Add(new HazardFact("unsafe", node.Kind().ToString(), line, col));
+    }
+    else if (node is MemberDeclarationSyntax md && md.Modifiers.Any(m => m.IsKind(SyntaxKind.UnsafeKeyword)))
+    {
+        var (line, col) = LocOf(md);
+        hazardsList.Add(new HazardFact("unsafe", "unsafe", line, col));
+    }
+    else if (node is IdentifierNameSyntax id && id.Identifier.Text == "dynamic" &&
+             (Sym(id) is ITypeSymbol { TypeKind: TypeKind.Dynamic } ||
+              (id.Parent is VariableDeclarationSyntax vd && vd.Type == id) ||
+              (id.Parent is ParameterSyntax ps && ps.Type == id) ||
+              (id.Parent is MethodDeclarationSyntax mtd && mtd.ReturnType == id) ||
+              (id.Parent is PropertyDeclarationSyntax prd && prd.Type == id) ||
+              id.Parent is TypeArgumentListSyntax or CastExpressionSyntax))
+    {
+        var (line, col) = LocOf(id);
+        hazardsList.Add(new HazardFact("dynamic", "dynamic", line, col));
+    }
+    else if (node is GenericNameSyntax gn)
+    {
+        var gname = gn.Identifier.Text;
+        if (gname is "Dictionary" or "ConcurrentDictionary" && gn.TypeArgumentList.Arguments.Count == 2)
+        {
+            var vType = gn.TypeArgumentList.Arguments[1].ToString();
+            if (vType is "object" or "object?" or "dynamic" or "System.Object")
+            {
+                var (line, col) = LocOf(gn);
+                hazardsList.Add(new HazardFact("blackboard", gn.ToString(), line, col));
+            }
+        }
+        else if (blackboardTypeNames.Contains(gname))
+        {
+            var (line, col) = LocOf(gn);
+            hazardsList.Add(new HazardFact("blackboard", gn.ToString(), line, col));
+        }
+    }
+    else if (node is IdentifierNameSyntax bId && blackboardTypeNames.Contains(bId.Identifier.Text) && bId.Parent is ObjectCreationExpressionSyntax or VariableDeclarationSyntax or ParameterSyntax or FieldDeclarationSyntax or PropertyDeclarationSyntax)
+    {
+        var (line, col) = LocOf(bId);
+        hazardsList.Add(new HazardFact("blackboard", bId.Identifier.Text, line, col));
+    }
+    else if (node is InvocationExpressionSyntax inv)
+    {
+        var sym = Sym(inv.Expression) as IMethodSymbol;
+        var ns = sym?.ContainingNamespace?.ToDisplayString() ?? "";
+        var typeName = sym?.ContainingType?.Name ?? (inv.Expression is MemberAccessExpressionSyntax maType ? maType.Expression.ToString() : "");
+        var mName = sym?.Name ?? (inv.Expression is MemberAccessExpressionSyntax ma ? ma.Name.Identifier.Text : inv.Expression.ToString());
+        if (ns.StartsWith("System.Reflection", StringComparison.Ordinal) ||
+            mName is "GetType" or "GetMethod" or "GetMethods" or "GetProperty" or "GetProperties"
+                or "GetField" or "GetFields" or "GetConstructor" or "GetConstructors"
+                or "InvokeMember" or "CreateInstance" ||
+            (typeName is "Assembly" && mName is "Load" or "LoadFrom" or "LoadFile"))
+        {
+            var (line, col) = LocOf(inv);
+            hazardsList.Add(new HazardFact("reflection", inv.Expression.ToString(), line, col));
+        }
+        else if (ns.StartsWith("System.Runtime.InteropServices", StringComparison.Ordinal) && typeName is "Marshal" or "GCHandle")
+        {
+            var (line, col) = LocOf(inv);
+            hazardsList.Add(new HazardFact("unsafe", inv.Expression.ToString(), line, col));
+        }
+    }
+    else if (node is UsingDirectiveSyntax u && (u.Name?.ToString().StartsWith("System.Reflection", StringComparison.Ordinal) == true))
+    {
+        var (line, col) = LocOf(u);
+        hazardsList.Add(new HazardFact("reflection", u.Name.ToString(), line, col));
+    }
+}
+
+var syntaxKindsList = new List<SyntaxKindFact>();
+foreach (var sn in root.DescendantNodesAndSelf())
+{
+    var (sl, sc) = LocOf(sn);
+    syntaxKindsList.Add(new SyntaxKindFact(sn.Kind().ToString(), sl, sc));
+}
+foreach (var tok in root.DescendantTokens())
+{
+    if (tok.IsKeyword() && tok.Kind() is SyntaxKind.UnsafeKeyword or SyntaxKind.AsyncKeyword
+        or SyntaxKind.VirtualKeyword or SyntaxKind.AbstractKeyword or SyntaxKind.OverrideKeyword
+        or SyntaxKind.VolatileKeyword or SyntaxKind.ExternKeyword or SyntaxKind.FixedKeyword
+        or SyntaxKind.StackAllocKeyword or SyntaxKind.DelegateKeyword or SyntaxKind.EventKeyword
+        or SyntaxKind.ParamsKeyword)
+    {
+        var tp = tok.GetLocation().GetLineSpan().StartLinePosition;
+        syntaxKindsList.Add(new SyntaxKindFact(tok.Kind().ToString(), tp.Line + 1, tp.Character + 1));
+    }
 }
 
 var globals = root.ChildNodes().OfType<GlobalStatementSyntax>().ToList();
 if (globals.Count > 0)
 {
-    var modBucket = new FunctionBucket("<module>", 1, 1, Array.Empty<string>());
+    var modLines = globals.Sum(g => { var (s, e, _) = SpanOf(g); return e - s + 1; });
+    var modBranches = 0;
+    var modNesting = 0;
+    foreach (var g in globals)
+    {
+        var gm = ComputeBodyMetrics(g, 0);
+        modBranches += gm.Branches;
+        if (gm.MaxNesting > modNesting) modNesting = gm.MaxNesting;
+    }
+    var modBucket = new FunctionBucket("<module>", 1, 1, Array.Empty<string>(), new FnMetrics(modLines, modBranches, modNesting));
     fnBuckets.Add(modBucket);
     var modSym = model.GetEnclosingSymbol(globals[0].SpanStart) as IMethodSymbol;
     foreach (var g in globals) WalkInto(g, "<module>", modSym, modBucket);
@@ -659,14 +920,16 @@ foreach (var d in topDecls)
 {
     var name = topNames[d];
     var sym = model.GetDeclaredSymbol(d) as IMethodSymbol;
-    var bucket = NewBucket(name, d, ParamNames(d));
-    fnBuckets.Add(bucket);
+    var (dStart, dEnd, _) = SpanOf(d);
     var body = d switch
     {
         BaseMethodDeclarationSyntax bm => (SyntaxNode?)bm.Body ?? bm.ExpressionBody,
         AccessorDeclarationSyntax acc => (SyntaxNode?)acc.Body ?? acc.ExpressionBody,
         _ => null,
     };
+    var metrics = ComputeBodyMetrics(body, dEnd - dStart + 1);
+    var bucket = NewBucket(name, d, ParamNames(d), metrics);
+    fnBuckets.Add(bucket);
     if (body != null) WalkInto(body, name, sym, bucket);
 }
 
@@ -675,10 +938,25 @@ var jsonOptions = new JsonSerializerOptions
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
 };
-Console.WriteLine(JsonSerializer.Serialize(new RayOutput(fileStr, "csharp", fnBuckets), jsonOptions));
+Console.WriteLine(JsonSerializer.Serialize(new RayOutput(fileStr, "csharp", fnBuckets, declarationsList, commentsInfo, importsList, hazardsList, syntaxKindsList), jsonOptions));
 
-sealed record RayOutput(string File, string Language, List<FunctionBucket> Functions);
-sealed record FunctionBucket(string Name, int Line, int Col, string[] Params)
+sealed record RayOutput(
+    string File,
+    string Language,
+    List<FunctionBucket> Functions,
+    List<DeclarationFact> Declarations,
+    CommentsInfo Comments,
+    List<ImportFact> Imports,
+    List<HazardFact> Hazards,
+    List<SyntaxKindFact> SyntaxKinds);
+sealed record FnMetrics(int Lines, int Branches, int MaxNesting);
+sealed record DeclarationFact(string Kind, string Name, List<string> Bases, List<string> Modifiers, int Line, int Col);
+sealed record CommentSpan(string Kind, int Line, int EndLine, int Col);
+sealed record CommentsInfo(int Count, List<CommentSpan> Spans);
+sealed record ImportFact(string Source, string Kind, int Line, int Col);
+sealed record HazardFact(string Kind, string Detail, int Line, int Col);
+sealed record SyntaxKindFact(string Kind, int Line, int Col);
+sealed record FunctionBucket(string Name, int Line, int Col, string[] Params, FnMetrics Metrics)
 {
     public List<ReadFact> Reads { get; } = new();
     public List<WriteFact> Writes { get; } = new();
